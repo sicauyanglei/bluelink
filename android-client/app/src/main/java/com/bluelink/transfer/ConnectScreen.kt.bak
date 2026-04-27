@@ -1,0 +1,633 @@
+package com.bluelink.transfer
+
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Cast
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Computer
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.LinkOff
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.SettingsEthernet
+import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import android.widget.Toast
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ConnectScreen(
+    onConnected: (TcpClient, FileTransferService) -> Unit,
+    onDisconnect: (() -> Unit)? = null,
+    isConnected: Boolean = false,
+    tabVisible: Boolean = false,
+    savedHost: String = "",
+    savedPort: String = "9000",
+    onHostChange: (String) -> Unit = {},
+    onPortChange: (String) -> Unit = {}
+) {
+    // 使用 savedHost/savedPort 初始化，切换标签时保留之前输入的值
+    var host by remember(savedHost) { mutableStateOf(savedHost) }
+    var port by remember(savedPort) { mutableStateOf(savedPort) }
+    var status by remember { mutableStateOf("") }
+    var isConnecting by remember { mutableStateOf(false) }
+    var isDiscovering by remember { mutableStateOf(false) }
+    var isScanningHotspot by remember { mutableStateOf(false) }
+    var isReconnecting by remember { mutableStateOf(false) }
+    var reconnectAttempt by remember { mutableStateOf(0) }
+    var hotspotDevices by remember { mutableStateOf<List<HotspotDevices.Device>>(emptyList()) }
+    var showErrorDialog by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf("") }
+    var debugLogs by remember { mutableStateOf<List<String>>(emptyList()) }
+    var showDebug by remember { mutableStateOf(false) }
+    var hotspotIP by remember { mutableStateOf<String?>(null) }
+    var gatewayIP by remember { mutableStateOf<String?>(null) }
+
+    // Current TCP client for reconnection support
+    // 使用 isConnected 作为 key 来保持 client 引用不被重组重置
+    var currentTcpClient by remember(isConnected) { mutableStateOf<TcpClient?>(null) }
+
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    val clipboardManager = LocalClipboardManager.current
+
+    // 设置调试日志回调和Context（同步快速）
+    LaunchedEffect(Unit) {
+        HotspotDevices.setContext(context)
+        HotspotDevices.debugLog = { log ->
+            debugLogs = (debugLogs + log).takeLast(50)
+        }
+    }
+
+    // 后台扫描热点IP和设备（只扫描热点同网段）
+    // 使用 tabVisible 作为 key，确保每次切换到 TCP 标签时都会重新扫描
+    LaunchedEffect(tabVisible) {
+        if (tabVisible) {
+            scope.launch {
+                // 异步检测热点IP
+                hotspotIP = HotspotDevices.getHotspotIP()
+                gatewayIP = HotspotDevices.getGatewayIP()
+
+                // 只扫描热点IP所在的子网
+                val currentHotspotIP = hotspotIP
+                if (currentHotspotIP != null) {
+                    val parts = currentHotspotIP.split(".")
+                    if (parts.size == 4) {
+                        val subnet = "${parts[0]}.${parts[1]}.${parts[2]}"
+                        debugLogs = (debugLogs + "扫描子网: $subnet.x").takeLast(50)
+                        hotspotDevices = HotspotDevices.scanSubnet(subnet)
+                        if (hotspotDevices.isNotEmpty()) {
+                            status = "发现 ${hotspotDevices.size} 个设备"
+
+                            // 如果只找到一个设备，自动填入并连接
+                            if (hotspotDevices.size == 1 && !isConnecting && !isConnected) {
+                                val targetIP = hotspotDevices.first().ip
+                                host = targetIP
+                                onHostChange(targetIP)
+                                status = "正在连接 $targetIP..."
+                                isConnecting = true
+                                scope.launch {
+                                    val tcpClient = TcpClient()
+                                    currentTcpClient = tcpClient
+                                    val portNum = port.toIntOrNull() ?: 9000
+                                    val result = tcpClient.connect(targetIP, portNum)
+                                    if (result.isSuccess) {
+                                        status = "连接成功！"
+                                        val transferService = FileTransferService(tcpClient)
+                                        onConnected(tcpClient, transferService)
+                                    } else {
+                                        val error = result.exceptionOrNull()?.message ?: "未知错误"
+                                        status = "连接失败"
+                                        errorMessage = error
+                                        showErrorDialog = true
+                                        isConnecting = false
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Set up TCP reconnection callbacks
+    LaunchedEffect(currentTcpClient) {
+        currentTcpClient?.onReconnecting = { attempt ->
+            reconnectAttempt = attempt
+            status = "正在重连... ($attempt/3)"
+        }
+        currentTcpClient?.onDisconnected = {
+            isReconnecting = true
+            scope.launch {
+                val result = currentTcpClient?.autoReconnect()
+                isReconnecting = false
+                if (result?.isSuccess == true) {
+                    status = "重连成功"
+                    currentTcpClient?.let { tcpClient ->
+                        val transferService = FileTransferService(tcpClient)
+                        onConnected(tcpClient, transferService)
+                    }
+                } else {
+                    status = "重连失败"
+                    errorMessage = result?.exceptionOrNull()?.message ?: "未知错误"
+                    showErrorDialog = true
+                }
+            }
+        }
+    }
+
+    // 检查连接状态当App恢复时
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                // 检查实际连接状态，如果已断开则通知父组件更新UI
+                val actualConnected = currentTcpClient?.isConnected == true
+                android.util.Log.d("ConnectScreen", ">>> ON_RESUME: currentTcpClient=${currentTcpClient}, isConnected=$actualConnected")
+                if (currentTcpClient != null && !actualConnected) {
+                    android.util.Log.d("ConnectScreen", ">>> 检测到连接已断开")
+                    onDisconnect?.invoke()
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    // Error Dialog
+    if (showErrorDialog) {
+        AlertDialog(
+            onDismissRequest = { showErrorDialog = false },
+            title = { Text("连接失败") },
+            text = {
+                Column {
+                    Text("无法连接到服务器")
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text("IP: $host:$port", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(errorMessage, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showErrorDialog = false }) {
+                    Text("确定")
+                }
+            }
+        )
+    }
+
+    // Main Layout - Vertical layout optimized for mobile
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp)
+    ) {
+        // Connection Status Card
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = when {
+                    isConnected -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f)
+                    hotspotIP != null -> MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.4f)
+                    else -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.3f)
+                }
+            ),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.Wifi,
+                        contentDescription = null,
+                        modifier = Modifier.size(28.dp),
+                        tint = if (hotspotIP != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Column {
+                        Text(
+                            text = if (isConnected) "已连接" else if (hotspotIP != null) "热点正常" else "未检测到热点",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = if (isConnected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = hotspotIP ?: "请开启手机热点",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                if (hotspotIP != null) {
+                    Column(horizontalAlignment = Alignment.End) {
+                        Text(
+                            text = "网关",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            text = gatewayIP ?: "-",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Check if server is reachable
+        suspend fun isServerReachable(ip: String): Boolean = withContext(Dispatchers.IO) {
+            try {
+                val socket = java.net.Socket()
+                socket.soTimeout = 500
+                socket.connect(java.net.InetSocketAddress(ip, 9000))
+                socket.close()
+                true
+            } catch (e: Exception) {
+                false
+            }
+        }
+
+        // UDP discovery
+        suspend fun discoverPc(): List<String> = withContext(Dispatchers.IO) {
+            val discoveryPort = 9001
+            val discoveryMessage = "BLUELINK_DISCOVER"
+            val timeoutMs = 2000
+            val allIPs = mutableListOf<String>()
+
+            val broadcastAddresses = listOf(
+                "255.255.255.255",
+                "192.168.43.255",
+                "192.168.44.255",
+                "192.168.1.255",
+                "10.89.247.255"
+            )
+
+            for (broadcastAddr in broadcastAddresses) {
+                var socket: java.net.DatagramSocket? = null
+                try {
+                    socket = java.net.DatagramSocket()
+                    socket.soTimeout = timeoutMs
+                    socket.broadcast = true
+
+                    val sendData = discoveryMessage.toByteArray()
+                    val sendPacket = java.net.DatagramPacket(
+                        sendData,
+                        sendData.size,
+                        java.net.InetAddress.getByName(broadcastAddr),
+                        discoveryPort
+                    )
+                    socket.send(sendPacket)
+
+                    val receiveData = ByteArray(2048)
+                    val receivePacket = java.net.DatagramPacket(receiveData, receiveData.size)
+
+                    try {
+                        socket.receive(receivePacket)
+                        val response = String(receiveData, 0, receivePacket.length)
+                        val parts = response.split("|")
+
+                        if (parts.size >= 2 && parts[0] == "BLUELINK_RESPONSE") {
+                            val ipsString = parts[1]
+                            val ips = ipsString.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                            allIPs.addAll(ips)
+                            break
+                        }
+                    } catch (e: Exception) {
+                        // Timeout
+                    }
+                } catch (e: Exception) {
+                    // Failed
+                } finally {
+                    socket?.close()
+                }
+            }
+
+            allIPs
+        }
+
+        // Connection Form Section
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surface
+            ),
+            shape = RoundedCornerShape(12.dp),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp)
+            ) {
+                Text(
+                    text = "服务器连接",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // IP Input
+                OutlinedTextField(
+                    value = host,
+                    onValueChange = {
+                        host = it
+                        onHostChange(it)
+                        if (status == "请选择或输入PC的IP地址") status = ""
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isConnecting && !isConnected,
+                    label = { Text("服务器IP") },
+                    placeholder = { Text("输入IP地址") },
+                    leadingIcon = {
+                        Icon(Icons.Default.Computer, contentDescription = null)
+                    },
+                    singleLine = true,
+                    shape = RoundedCornerShape(10.dp)
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                // Port Input
+                OutlinedTextField(
+                    value = port,
+                    onValueChange = {
+                        port = it
+                        onPortChange(it)
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isConnecting && !isConnected,
+                    label = { Text("端口") },
+                    leadingIcon = {
+                        Icon(Icons.Default.SettingsEthernet, contentDescription = null)
+                    },
+                    singleLine = true,
+                    shape = RoundedCornerShape(10.dp)
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Status Message
+                if (status.isNotEmpty()) {
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = when {
+                                status.contains("成功") -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f)
+                                status.contains("重连") -> MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.5f)
+                                status.contains("失败") || status.contains("未找到") || status.contains("请选择") ->
+                                    MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f)
+                                else -> MaterialTheme.colorScheme.surfaceVariant
+                            }
+                        ),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            when {
+                                status.contains("成功") -> Icon(Icons.Default.CheckCircle, null, Modifier.size(16.dp), MaterialTheme.colorScheme.primary)
+                                status.contains("失败") || status.contains("未找到") || status.contains("请选择") ->
+                                    Icon(Icons.Default.Error, null, Modifier.size(16.dp), MaterialTheme.colorScheme.error)
+                                isConnecting || isDiscovering -> CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                                else -> Icon(Icons.Default.Info, null, Modifier.size(16.dp), MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(status, style = MaterialTheme.typography.bodyMedium)
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(12.dp))
+                }
+
+                // Action Buttons
+                if (isConnected) {
+                    // Disconnect Button
+                    OutlinedButton(
+                        onClick = {
+                            currentTcpClient?.disconnect()
+                            onDisconnect?.invoke()
+                            status = "已断开连接"
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        contentPadding = PaddingValues(vertical = 12.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error
+                        ),
+                        border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.error),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.LinkOff, contentDescription = null)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("断开连接", style = MaterialTheme.typography.titleMedium)
+                    }
+                } else {
+                    // Connect Button
+                    Button(
+                        onClick = {
+                            if (host.isBlank()) {
+                                status = "请选择或输入PC的IP地址"
+                                return@Button
+                            }
+                            isConnecting = true
+                            status = "正在连接..."
+                            scope.launch {
+                                val tcpClient = TcpClient()
+                                currentTcpClient = tcpClient
+                                val portNum = port.toIntOrNull() ?: 9000
+                                val result = tcpClient.connect(host, portNum)
+
+                                if (result.isSuccess) {
+                                    status = "连接成功！"
+                                    val transferService = FileTransferService(tcpClient)
+                                    onConnected(tcpClient, transferService)
+                                } else {
+                                    val error = result.exceptionOrNull()?.message ?: "未知错误"
+                                    status = "连接失败: $error"
+                                    errorMessage = error
+                                    showErrorDialog = true
+                                    isConnecting = false
+                                }
+                            }
+                        },
+                        enabled = !isConnecting && host.isNotBlank(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.primary
+                        )
+                    ) {
+                        if (isConnecting) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(20.dp),
+                                color = MaterialTheme.colorScheme.onPrimary,
+                                strokeWidth = 2.dp
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                        } else {
+                            Icon(Icons.Default.Cast, contentDescription = null)
+                            Spacer(modifier = Modifier.width(8.dp))
+                        }
+                        Text(if (isConnecting) "连接中..." else "连接服务器", style = MaterialTheme.typography.titleMedium)
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    // Scan Button
+                    OutlinedButton(
+                        onClick = {
+                            isDiscovering = true
+                            status = "正在扫描..."
+                            scope.launch {
+                                val discoveredIPs = mutableListOf<String>()
+
+                                // UDP broadcast
+                                val udpIPs = discoverPc()
+                                discoveredIPs.addAll(udpIPs)
+
+                                // TCP scan
+                                val scanResults = NetworkScanner.quickScan()
+                                discoveredIPs.addAll(scanResults.map { it.ip })
+
+                                // Also check gateway
+                                val gateway = HotspotDevices.getGatewayIP()
+                                if (gateway != null && isServerReachable(gateway)) {
+                                    discoveredIPs.add(gateway)
+                                }
+
+                            val uniqueIPs = discoveredIPs.distinct()
+
+                            if (uniqueIPs.isNotEmpty()) {
+                                host = uniqueIPs.first()
+                                status = "已找到: ${uniqueIPs.joinToString()}"
+                            } else {
+                                status = "未找到PC服务器"
+                            }
+                            isDiscovering = false
+                        }
+                    },
+                    enabled = !isDiscovering && !isConnecting,
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(vertical = 8.dp)
+                ) {
+                    if (isDiscovering) {
+                        CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 2.dp)
+                    } else {
+                        Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(12.dp))
+                    }
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(if (isDiscovering) "扫描中..." else "扫描网络", fontSize = 11.sp)
+                }
+            }
+        }
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Check if server is reachable
+        suspend fun isServerReachable(ip: String): Boolean = withContext(Dispatchers.IO) {
+            try {
+                val socket = java.net.Socket()
+                socket.soTimeout = 500
+                socket.connect(java.net.InetSocketAddress(ip, 9000))
+                socket.close()
+                true
+            } catch (e: Exception) {
+                false
+            }
+        }
+
+        // UDP discovery
+        suspend fun discoverPc(): List<String> = withContext(Dispatchers.IO) {
+            val discoveryPort = 9001
+            val discoveryMessage = "BLUELINK_DISCOVER"
+            val timeoutMs = 2000
+            val allIPs = mutableListOf<String>()
+
+            val broadcastAddresses = listOf(
+                "255.255.255.255",
+                "192.168.43.255",
+                "192.168.44.255",
+                "192.168.1.255",
+                "10.89.247.255"
+            )
+
+            for (broadcastAddr in broadcastAddresses) {
+                var socket: java.net.DatagramSocket? = null
+                try {
+                    socket = java.net.DatagramSocket()
+                    socket.soTimeout = timeoutMs
+                    socket.broadcast = true
+
+                    val sendData = discoveryMessage.toByteArray()
+                    val sendPacket = java.net.DatagramPacket(
+                        sendData,
+                        sendData.size,
+                        java.net.InetAddress.getByName(broadcastAddr),
+                        discoveryPort
+                    )
+                    socket.send(sendPacket)
+
+                    val receiveData = ByteArray(2048)
+                    val receivePacket = java.net.DatagramPacket(receiveData, receiveData.size)
+
+                    try {
+                        socket.receive(receivePacket)
+                        val response = String(receiveData, 0, receivePacket.length)
+                        val parts = response.split("|")
+
+                        if (parts.size >= 2 && parts[0] == "BLUELINK_RESPONSE") {
+                            val ipsString = parts[1]
+                            val ips = ipsString.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                            allIPs.addAll(ips)
+                            break
+                        }
+                    } catch (e: Exception) {
+                        // Timeout
+                    }
+                } catch (e: Exception) {
+                    // Failed
+                } finally {
+                    socket?.close()
+                }
+            }
+
+            allIPs
+        }
+
+        // Connection Form Section

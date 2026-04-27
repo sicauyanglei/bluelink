@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(keytool -genkeypair -v -keystore release.jks -alias bluelink -keyalg RSA -keysize 2048 -validity 10000 -storepass bluelink123 -keypass bluelink123 -dname \"CN=BluLink, OU=Dev, O=BluLink, L=Beijing, ST=Beijing, C=CN\")",
+      "Bash(./gradlew assembleRelease --no-daemon)",
+      "Bash(/c/Python314/python -c ':*)",
+      "Bash(./gradlew assembleDebug)",
+      "Bash(./gradlew assembleRelease)",
+      "Bash(dotnet build:*)"
+    ]
+  }
+}
