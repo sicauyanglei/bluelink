@@ -500,26 +500,33 @@ class FileTransferService(private val client: TransferClient) {
             context.contentResolver.openInputStream(uri)?.use { inputStream ->
                 val buffer = ByteArray(chunkSize)
                 var bytesRead: Int
+                var retryCount = 0
+                val maxRetries = 3
 
                 while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                    // Always copy the data - buffer is reused and must not be modified during send
                     val chunkData = if (bytesRead == chunkSize) buffer.copyOf(chunkSize) else buffer.copyOf(bytesRead)
                     chunkCount++
 
-                    // Send chunk with protocol header (CMD_UPLOAD_CHUNK)
                     val chunkPacket = FileTransferProtocol.createPacket(FileTransferProtocol.CMD_UPLOAD_CHUNK, chunkData)
-                    writeResult = client.writeRaw(chunkPacket)
+                    writeResult = false
+                    retryCount = 0
+
+                    while (!writeResult && retryCount < maxRetries) {
+                        writeResult = client.writeRaw(chunkPacket)
+                        if (!writeResult) {
+                            retryCount++
+                            android.util.Log.w("FileTransferService", "=== [UPLOAD CHUNKED] chunk $chunkCount write retry $retryCount")
+                            kotlinx.coroutines.delay(100 * retryCount.toLong())
+                        }
+                    }
+
                     if (!writeResult) {
-                        android.util.Log.e("FileTransferService", "=== [UPLOAD CHUNKED] chunk $chunkCount write FAILED at totalSent=$totalSent")
+                        android.util.Log.e("FileTransferService", "=== [UPLOAD CHUNKED] chunk $chunkCount write FAILED after $maxRetries retries at totalSent=$totalSent")
                         return@withContext Result.failure(Exception("发送数据失败"))
                     }
                     totalSent += bytesRead
-                    // Report progress
                     if (chunkCount % 10 == 0) {
                         onProgress?.invoke(totalSent, fileSize)
-                    }
-                    if (chunkCount % 50 == 0) {
-                        android.util.Log.d("FileTransferService", "=== [UPLOAD CHUNKED] chunk $chunkCount sent, totalSent=$totalSent")
                     }
                 }
                 android.util.Log.d("FileTransferService", "=== [UPLOAD CHUNKED] all chunks sent, totalChunks=$chunkCount, totalSent=$totalSent")

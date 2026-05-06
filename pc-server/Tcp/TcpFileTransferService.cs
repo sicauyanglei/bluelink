@@ -143,7 +143,6 @@ public class TcpFileTransferService
         var items = new List<FileItem>();
         var currentDir = GetAbsolutePath();
 
-        // Add parent directory indicator if not at root
         if (!string.IsNullOrEmpty(_currentPath))
         {
             items.Add(new FileItem
@@ -156,34 +155,62 @@ public class TcpFileTransferService
             });
         }
 
-        // Get directories
         if (Directory.Exists(currentDir))
         {
-            var dirs = Directory.GetDirectories(currentDir)
-                .Select(d => new DirectoryInfo(d))
-                .Select(di => new FileItem
-                {
-                    Name = di.Name,
-                    Size = 0,
-                    ModifiedTime = di.LastWriteTime,
-                    IsDirectory = true
-                })
-                .ToList();
-            items.AddRange(dirs);
-        }
-
-        // Get files
-        var files = Directory.GetFiles(currentDir)
-            .Select(f => new FileInfo(f))
-            .Select(fi => new FileItem
+            try
             {
-                Name = fi.Name,
-                Size = fi.Length,
-                ModifiedTime = fi.LastWriteTime,
-                IsDirectory = false
-            })
-            .ToList();
-        items.AddRange(files);
+                var dirPaths = Directory.GetDirectories(currentDir);
+                foreach (var d in dirPaths)
+                {
+                    try
+                    {
+                        var di = new DirectoryInfo(d);
+                        items.Add(new FileItem
+                        {
+                            Name = di.Name,
+                            Size = 0,
+                            ModifiedTime = di.LastWriteTime,
+                            IsDirectory = true
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        SafeLog($"TCP: 跳过目录: {d}, 原因: {ex.Message}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                SafeLog($"TCP: 枚举目录失败: {ex.Message}");
+            }
+
+            try
+            {
+                var filePaths = Directory.GetFiles(currentDir);
+                foreach (var f in filePaths)
+                {
+                    try
+                    {
+                        var fi = new FileInfo(f);
+                        items.Add(new FileItem
+                        {
+                            Name = fi.Name,
+                            Size = fi.Length,
+                            ModifiedTime = fi.LastWriteTime,
+                            IsDirectory = false
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        SafeLog($"TCP: 跳过文件: {f}, 原因: {ex.Message}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                SafeLog($"TCP: 枚举文件失败: {ex.Message}");
+            }
+        }
 
         var responseData = new
         {

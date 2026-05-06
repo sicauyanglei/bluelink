@@ -211,6 +211,10 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
     }
 
     override suspend fun writePacket(command: Byte, data: ByteArray): Boolean = withContext(Dispatchers.IO) {
+        if (outputStream == null) {
+            Log.e(TAG, "writePacket: outputStream is null!")
+            return@withContext false
+        }
         try {
             val length = data.size
             val header = byteArrayOf(command) + intToBytes(length)
@@ -222,18 +226,45 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
             true
         } catch (e: Exception) {
             Log.e(TAG, "writePacket error: ${e.javaClass.simpleName}: ${e.message}")
-            false
+            // Retry once for transient errors
+            try {
+                kotlinx.coroutines.delay(100)
+                val length = data.size
+                val header = byteArrayOf(command) + intToBytes(length)
+                outputStream?.write(header)
+                outputStream?.write(data)
+                outputStream?.flush()
+                Log.d(TAG, "writePacket: retry succeeded")
+                true
+            } catch (e2: Exception) {
+                Log.e(TAG, "writePacket retry failed: ${e2.javaClass.simpleName}: ${e2.message}")
+                false
+            }
         }
     }
 
     override suspend fun writeRaw(data: ByteArray): Boolean = withContext(Dispatchers.IO) {
+        if (outputStream == null) {
+            Log.e(TAG, "writeRaw: outputStream is null!")
+            return@withContext false
+        }
         try {
             outputStream?.write(data)
             outputStream?.flush()
             true
         } catch (e: Exception) {
             Log.e(TAG, "writeRaw error: ${e.javaClass.simpleName}: ${e.message}")
-            false
+            // Retry once for transient errors
+            try {
+                kotlinx.coroutines.delay(50)
+                outputStream?.write(data)
+                outputStream?.flush()
+                Log.d(TAG, "writeRaw: retry succeeded")
+                true
+            } catch (e2: Exception) {
+                Log.e(TAG, "writeRaw retry failed: ${e2.javaClass.simpleName}: ${e2.message}")
+                false
+            }
         }
     }
 
