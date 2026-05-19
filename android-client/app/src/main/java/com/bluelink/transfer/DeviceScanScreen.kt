@@ -41,7 +41,7 @@ import kotlinx.coroutines.launch
 @Composable
 fun DeviceScanScreen(
     bluetoothAdapter: BluetoothAdapter?,
-    onConnected: (BluetoothClient) -> Unit,
+    onConnected: (BluetoothClient, FileTransferService) -> Unit,
     onDisconnect: () -> Unit,
     isConnected: Boolean,
     visible: Boolean = true
@@ -80,7 +80,8 @@ fun DeviceScanScreen(
                 if (result?.isSuccess == true) {
                     addLog(">>> 重连成功")
                     connectionStatus = "重连成功"
-                    onConnected(client!!)
+                    val transferService = FileTransferService(client)
+                    onConnected(client, transferService)
                 } else {
                     addLog(">>> 重连失败: ${result?.exceptionOrNull()?.message}")
                     connectionStatus = "重连失败"
@@ -438,7 +439,8 @@ fun DeviceScanScreen(
                                         if (result?.isSuccess == true) {
                                             connectionStatus = "连接成功"
                                             addLog(">>> 连接成功，调用 onConnected()")
-                                            onConnected(client!!)
+                                            val transferService = FileTransferService(client)
+                                            onConnected(client, transferService)
                                             addLog(">>> onConnected() 调用完成")
                                         } else {
                                             val error = result?.exceptionOrNull()?.message ?: "未知错误"

@@ -18,10 +18,12 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
         // Standard Serial Port Profile (SPP) UUID - works better with Windows
         val SERVICE_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
         private const val TAG = "BluetoothClient"
-        private const val CONNECT_TIMEOUT_MS = 30000  // 30 seconds connection timeout
-        private const val READ_TIMEOUT_MS = 30000     // 30 seconds read timeout
+        private const val CONNECT_TIMEOUT_MS = 30000 // 30 seconds connection timeout
+        private const val READ_TIMEOUT_MS = 30000    // 30 seconds read timeout
         private const val MAX_RECONNECT_ATTEMPTS = 3
-        private const val RECONNECT_DELAY_MS = 2000L  // 2 seconds between attempts
+        private const val RECONNECT_DELAY_MS = 2000L // 2 seconds between attempts
+        private const val HEARTBEAT_INTERVAL_MS = 30000L // 30秒心跳
+        private const val HEARTBEAT_TIMEOUT_MS = 10000L // 10秒超时
     }
 
     private var socket: BluetoothSocket? = null
@@ -33,6 +35,11 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
     private var lastConnectedDevice: BluetoothDevice? = null
     var onDisconnected: (() -> Unit)? = null
     var onReconnecting: ((attempt: Int) -> Unit)? = null
+    var onReconnected: (() -> Unit)? = null
+
+    // 心跳相关
+    private var heartBeatJob: kotlinx.coroutines.Job? = null
+    private var isManuallyDisconnected = false
 
     override val isConnected: Boolean get() = socket?.isConnected == true
 
@@ -89,8 +96,11 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
 
             // Remember this device for auto-reconnect
             lastConnectedDevice = device
+            isManuallyDisconnected = false
 
             Log.d(TAG, "connected successfully with ${CONNECT_TIMEOUT_MS}ms timeout")
+            // 启动心跳
+            startHeartBeat()
             Result.success(Unit)
         } catch (e: IOException) {
             Log.e(TAG, "IO error: ${e.javaClass.simpleName}: ${e.message}")
@@ -139,6 +149,9 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
                 setSocketTimeout(socket, READ_TIMEOUT_MS)
 
                 Log.d(TAG, "autoReconnect: success on attempt $attempt")
+                // 启动心跳
+                startHeartBeat()
+                onReconnected?.invoke()
                 return@withContext Result.success(Unit)
             } catch (e: Exception) {
                 Log.e(TAG, "autoReconnect: attempt $attempt failed: ${e.message}")
@@ -156,6 +169,8 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
     }
 
     override fun disconnect() {
+        isManuallyDisconnected = true
+        stopHeartBeat()
         try {
             inputStream?.close()
             outputStream?.close()
@@ -170,15 +185,47 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
         lastConnectedDevice = null
     }
 
+    private fun startHeartBeat() {
+        stopHeartBeat()
+        heartBeatJob = kotlinx.coroutines.GlobalScope.launch {
+            while (isConnected && !isManuallyDisconnected) {
+                try {
+                    delay(HEARTBEAT_INTERVAL_MS)
+                    Log.d(TAG, "sending heartbeat...")
+                    // 发送一个简单的心跳包（比如空数据）
+                    writeRaw(byteArrayOf(0x00))
+                } catch (e: Exception) {
+                    Log.e(TAG, "heartbeat error: ${e.message}")
+                    if (!isManuallyDisconnected) {
+                        Log.d(TAG, "heartbeat failed, triggering reconnection...")
+                        // 在协程中异步触发重连，避免阻塞
+                        kotlinx.coroutines.GlobalScope.launch {
+                            autoReconnect()
+                        }
+                    }
+                    break
+                }
+            }
+        }
+    }
+
+    private fun stopHeartBeat() {
+        heartBeatJob?.cancel()
+        heartBeatJob = null
+    }
+
     override suspend fun readPacket(): ByteArray? = withContext(Dispatchers.IO) {
         try {
             // Read 5-byte header
             val header = ByteArray(5)
             Log.d(TAG, "[${System.currentTimeMillis()%100000}] readPacket: waiting for header...")
-            val headerRead = inputStream?.read(header) ?: return@withContext null
+            val headerRead = inputStream?.read(header) ?: run {
+                handleReadError()
+                return@withContext null
+            }
             Log.d(TAG, "[${System.currentTimeMillis()%100000}] readPacket: headerRead=$headerRead")
             if (headerRead != 5) {
-                Log.w(TAG, "incomplete header: $headerRead bytes")
+                handleReadError()
                 return@withContext null
             }
 
@@ -196,6 +243,7 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
                 val read = inputStream?.read(data, offset, length - offset) ?: 0
                 if (read <= 0) {
                     Log.w(TAG, "read returned $read, connection may be closed")
+                    handleReadError()
                     return@withContext null
                 }
                 offset += read
@@ -206,13 +254,24 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
         } catch (e: Exception) {
             Log.e(TAG, "readPacket error: ${e.javaClass.simpleName}: ${e.message}")
             toast?.invoke("读取异常: ${e.message}")
+            handleReadError()
             null
+        }
+    }
+
+    private fun handleReadError() {
+        if (!isManuallyDisconnected) {
+            Log.d(TAG, "read failed, triggering reconnection...")
+            kotlinx.coroutines.GlobalScope.launch {
+                autoReconnect()
+            }
         }
     }
 
     override suspend fun writePacket(command: Byte, data: ByteArray): Boolean = withContext(Dispatchers.IO) {
         if (outputStream == null) {
             Log.e(TAG, "writePacket: outputStream is null!")
+            handleWriteError()
             return@withContext false
         }
         try {
@@ -238,6 +297,7 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
                 true
             } catch (e2: Exception) {
                 Log.e(TAG, "writePacket retry failed: ${e2.javaClass.simpleName}: ${e2.message}")
+                handleWriteError()
                 false
             }
         }
@@ -246,6 +306,7 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
     override suspend fun writeRaw(data: ByteArray): Boolean = withContext(Dispatchers.IO) {
         if (outputStream == null) {
             Log.e(TAG, "writeRaw: outputStream is null!")
+            handleWriteError()
             return@withContext false
         }
         try {
@@ -263,7 +324,17 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
                 true
             } catch (e2: Exception) {
                 Log.e(TAG, "writeRaw retry failed: ${e2.javaClass.simpleName}: ${e2.message}")
+                handleWriteError()
                 false
+            }
+        }
+    }
+
+    private fun handleWriteError() {
+        if (!isManuallyDisconnected) {
+            Log.d(TAG, "write failed, triggering reconnection...")
+            kotlinx.coroutines.GlobalScope.launch {
+                autoReconnect()
             }
         }
     }

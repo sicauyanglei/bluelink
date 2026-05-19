@@ -4,9 +4,12 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -115,44 +118,106 @@ class MainActivity : ComponentActivity() {
         _pathChangedTrigger++
     }
 
-    private val requiredPermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        arrayOf(
-            Manifest.permission.BLUETOOTH_CONNECT,
-            Manifest.permission.BLUETOOTH_SCAN,
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_WIFI_STATE,
-            Manifest.permission.ACCESS_NETWORK_STATE,
-            Manifest.permission.REQUEST_INSTALL_PACKAGES  // For APK installation
-        )
-    } else {
-        arrayOf(
-            Manifest.permission.BLUETOOTH,
-            Manifest.permission.BLUETOOTH_ADMIN,
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_WIFI_STATE,
-            Manifest.permission.ACCESS_NETWORK_STATE
-        )
+    private val requiredPermissions = when {
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> {
+            // Android 13+ (API 33+)
+            arrayOf(
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_WIFI_STATE,
+                Manifest.permission.ACCESS_NETWORK_STATE,
+                Manifest.permission.REQUEST_INSTALL_PACKAGES,
+                Manifest.permission.READ_MEDIA_IMAGES,
+                Manifest.permission.READ_MEDIA_VIDEO,
+                Manifest.permission.READ_MEDIA_AUDIO
+            )
+        }
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+            // Android 12-12L (API 31-32)
+            arrayOf(
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_WIFI_STATE,
+                Manifest.permission.ACCESS_NETWORK_STATE,
+                Manifest.permission.REQUEST_INSTALL_PACKAGES,
+                Manifest.permission.READ_EXTERNAL_STORAGE,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE
+            )
+        }
+        else -> {
+            // Android 11 and below (API 30-)
+            arrayOf(
+                Manifest.permission.BLUETOOTH,
+                Manifest.permission.BLUETOOTH_ADMIN,
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_WIFI_STATE,
+                Manifest.permission.ACCESS_NETWORK_STATE,
+                Manifest.permission.READ_EXTERNAL_STORAGE,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE
+            )
+        }
     }
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
+        addDebugLog(">>> 权限请求结果:")
+        permissions.forEach { (permission, granted) ->
+            addDebugLog(">>>   $permission: $granted")
+        }
         val allGranted = permissions.values.all { it }
         if (!allGranted) {
-            // Handle permission denied - show message
+            addDebugLog(">>> 部分权限未授予！")
+        } else {
+            addDebugLog(">>> 所有权限已授予！")
+        }
+        // 检查管理存储权限
+        checkAndRequestManageStorage()
+    }
+
+    // 用于请求管理存储权限
+    private val manageStorageLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        checkAndRequestManageStorage()
+    }
+
+    private fun checkAndRequestManageStorage() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (Environment.isExternalStorageManager()) {
+                addDebugLog(">>> 已获得管理存储权限！")
+            } else {
+                addDebugLog(">>> 请求管理存储权限...")
+                val intent = Intent(
+                    android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:$packageName")
+                )
+                manageStorageLauncher.launch(intent)
+            }
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        addDebugLog(">>> MainActivity onCreate 开始")
+        
         // Request permissions if not granted
         val permissionsToRequest = requiredPermissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }.toTypedArray()
 
+        addDebugLog(">>> 需要请求的权限: ${permissionsToRequest.joinToString()}")
+
         if (permissionsToRequest.isNotEmpty()) {
+            addDebugLog(">>> 正在请求权限...")
             permissionLauncher.launch(permissionsToRequest)
+        } else {
+            addDebugLog(">>> 所有权限已授予，无需请求")
+            // 检查管理存储权限
+            checkAndRequestManageStorage()
         }
 
         // Get Bluetooth adapter
@@ -399,9 +464,10 @@ fun MainScreen(
 
         // Debug log dialog
         if (showDebugLog) {
+            val context = androidx.compose.ui.platform.LocalContext.current
             AlertDialog(
                 onDismissRequest = onToggleDebugLog,
-                title = { Text("调试日志 (点击复制)") },
+                title = { Text("调试日志") },
                 text = {
                     Column {
                         val logText = debugLogs.joinToString("\n")
@@ -417,6 +483,20 @@ fun MainScreen(
                 },
                 confirmButton = {
                     Row {
+                        TextButton(onClick = {
+                            val logText = debugLogs.joinToString("\n")
+                            if (logText.isNotEmpty()) {
+                                val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                val clip = android.content.ClipData.newPlainText("Debug Log", logText)
+                                clipboard.setPrimaryClip(clip)
+                                android.widget.Toast.makeText(context, "已复制到剪贴板", android.widget.Toast.LENGTH_SHORT).show()
+                            } else {
+                                android.widget.Toast.makeText(context, "日志为空", android.widget.Toast.LENGTH_SHORT).show()
+                            }
+                        }) {
+                            Text("复制")
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
                         TextButton(onClick = onClearDebugLog) {
                             Text("清空")
                         }
@@ -477,10 +557,8 @@ fun MainScreen(
             // Bluetooth Tab - always composed, just hidden when not selected
             DeviceScanScreen(
                 bluetoothAdapter = bluetoothAdapter,
-                onConnected = { client ->
-                    android.util.Log.d("MainActivity", ">>> onConnected callback: client=$client")
-                    val service = FileTransferService(client)
-                    android.util.Log.d("MainActivity", ">>> created FileTransferService: $service")
+                onConnected = { client, service ->
+                    android.util.Log.d("MainActivity", ">>> onConnected callback: client=$client, service=$service")
                     onBluetoothConnected(client, service)
                     // Auto switch to file tab after connection
                     selectedTab = 2
@@ -549,7 +627,7 @@ fun MainScreen(
                                         }
                                     }
                                 }
-                            }
+                            },
                         )
                     }
                 } else {

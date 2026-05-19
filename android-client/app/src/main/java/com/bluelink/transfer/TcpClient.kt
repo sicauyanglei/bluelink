@@ -10,6 +10,8 @@ class TcpClient : TransferClient {
         private const val TAG = "TcpClient"
         private const val MAX_RECONNECT_ATTEMPTS = 3
         private const val RECONNECT_DELAY_MS = 2000L
+        private const val HEARTBEAT_INTERVAL_MS = 30000L // 30秒心跳
+        private const val HEARTBEAT_TIMEOUT_MS = 10000L // 10秒超时
     }
 
     private var socket: Socket? = null
@@ -21,6 +23,11 @@ class TcpClient : TransferClient {
     private var lastPort: Int? = null
     var onReconnecting: ((attempt: Int) -> Unit)? = null
     var onDisconnected: (() -> Unit)? = null
+    var onReconnected: (() -> Unit)? = null
+
+    // 心跳相关
+    private var heartBeatJob: kotlinx.coroutines.Job? = null
+    private var isManuallyDisconnected = false
 
     override val isConnected: Boolean get() = socket?.isConnected == true
 
@@ -36,8 +43,11 @@ class TcpClient : TransferClient {
             // Remember for auto-reconnect
             lastHost = host
             lastPort = port
+            isManuallyDisconnected = false
 
             Log.d(TAG, "connected successfully")
+            // 启动心跳
+            startHeartBeat()
             Result.success(Unit)
         } catch (e: IOException) {
             Log.e(TAG, "connect error: ${e.message}")
@@ -72,6 +82,9 @@ class TcpClient : TransferClient {
                 outputStream = socket?.getOutputStream()
 
                 Log.d(TAG, "autoReconnect: success on attempt $attempt")
+                // 启动心跳
+                startHeartBeat()
+                onReconnected?.invoke()
                 return@withContext Result.success(Unit)
             } catch (e: Exception) {
                 Log.e(TAG, "autoReconnect: attempt $attempt failed: ${e.message}")
@@ -88,6 +101,8 @@ class TcpClient : TransferClient {
     }
 
     override fun disconnect() {
+        isManuallyDisconnected = true
+        stopHeartBeat()
         try {
             socket?.close()
         } catch (e: IOException) { }
@@ -98,12 +113,47 @@ class TcpClient : TransferClient {
         lastPort = null
     }
 
+    private fun startHeartBeat() {
+        stopHeartBeat()
+        heartBeatJob = kotlinx.coroutines.GlobalScope.launch {
+            while (isConnected && !isManuallyDisconnected) {
+                try {
+                    delay(HEARTBEAT_INTERVAL_MS)
+                    Log.d(TAG, "sending heartbeat...")
+                    // 发送一个简单的心跳包（比如空数据）
+                    writeRaw(byteArrayOf(0x00))
+                } catch (e: Exception) {
+                    Log.e(TAG, "heartbeat error: ${e.message}")
+                    if (!isManuallyDisconnected) {
+                        Log.d(TAG, "heartbeat failed, triggering reconnection...")
+                        // 在协程中异步触发重连，避免阻塞
+                        kotlinx.coroutines.GlobalScope.launch {
+                            autoReconnect()
+                        }
+                    }
+                    break
+                }
+            }
+        }
+    }
+
+    private fun stopHeartBeat() {
+        heartBeatJob?.cancel()
+        heartBeatJob = null
+    }
+
     override suspend fun readPacket(): ByteArray? = withContext(Dispatchers.IO) {
         try {
             // Read 5-byte header
             val header = ByteArray(5)
-            val headerRead = inputStream?.read(header) ?: return@withContext null
-            if (headerRead != 5) return@withContext null
+            val headerRead = inputStream?.read(header) ?: run {
+                handleReadError()
+                return@withContext null
+            }
+            if (headerRead != 5) {
+                handleReadError()
+                return@withContext null
+            }
 
             val length = ((header[1].toInt() and 0xFF) shl 24) or
                         ((header[2].toInt() and 0xFF) shl 16) or
@@ -116,20 +166,34 @@ class TcpClient : TransferClient {
             var offset = 0
             while (offset < length) {
                 val read = inputStream?.read(data, offset, length - offset) ?: 0
-                if (read <= 0) return@withContext null
+                if (read <= 0) {
+                    handleReadError()
+                    return@withContext null
+                }
                 offset += read
             }
 
             header + data
         } catch (e: Exception) {
             Log.e(TAG, "readPacket error: ${e.message}")
+            handleReadError()
             null
+        }
+    }
+
+    private fun handleReadError() {
+        if (!isManuallyDisconnected) {
+            Log.d(TAG, "read failed, triggering reconnection...")
+            kotlinx.coroutines.GlobalScope.launch {
+                autoReconnect()
+            }
         }
     }
 
     override suspend fun writePacket(command: Byte, data: ByteArray): Boolean = withContext(Dispatchers.IO) {
         if (outputStream == null) {
             android.util.Log.e(TAG, "writePacket: outputStream is null!")
+            handleWriteError()
             return@withContext false
         }
         try {
@@ -155,6 +219,7 @@ class TcpClient : TransferClient {
                 true
             } catch (e2: Exception) {
                 android.util.Log.e(TAG, "writePacket retry failed: ${e2.javaClass.simpleName}: ${e2.message}")
+                handleWriteError()
                 false
             }
         }
@@ -163,6 +228,7 @@ class TcpClient : TransferClient {
     override suspend fun writeRaw(data: ByteArray): Boolean = withContext(Dispatchers.IO) {
         if (outputStream == null) {
             Log.e(TAG, "writeRaw: outputStream is null!")
+            handleWriteError()
             return@withContext false
         }
         try {
@@ -180,7 +246,17 @@ class TcpClient : TransferClient {
                 true
             } catch (e2: Exception) {
                 Log.e(TAG, "writeRaw retry failed: ${e2.javaClass.simpleName}: ${e2.message}")
+                handleWriteError()
                 false
+            }
+        }
+    }
+
+    private fun handleWriteError() {
+        if (!isManuallyDisconnected) {
+            Log.d(TAG, "write failed, triggering reconnection...")
+            kotlinx.coroutines.GlobalScope.launch {
+                autoReconnect()
             }
         }
     }
