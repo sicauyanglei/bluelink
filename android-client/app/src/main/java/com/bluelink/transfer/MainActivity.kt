@@ -44,12 +44,14 @@ class MainActivity : ComponentActivity() {
     private var _tcpPort by mutableStateOf("9000")
     private var _debugLogs by mutableStateOf<List<String>>(emptyList())
     private var _showDebugLog by mutableStateOf(false)
+    private var _resumeCount by mutableIntStateOf(0)
     val bluetoothClient get() = _bluetoothClient
     val tcpClient get() = _tcpClient
     val transferService get() = _transferService
     val refreshTrigger get() = _refreshTrigger
     val pathChangedTrigger get() = _pathChangedTrigger
     val resumeTrigger get() = _resumeTrigger
+    val resumeCount get() = _resumeCount
     val tcpHost get() = _tcpHost
     val tcpPort get() = _tcpPort
     val debugLogs get() = _debugLogs
@@ -199,6 +201,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        _resumeCount++
+        addDebugLog(">>> MainActivity onResume - resumeCount=$_resumeCount")
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -238,6 +246,7 @@ class MainActivity : ComponentActivity() {
                         tcpClient = tcpClient,
                         transferService = transferService,
                         pathChangedTrigger = _pathChangedTrigger,
+                        resumeCount = _resumeCount,
                         tcpHost = _tcpHost,
                         tcpPort = _tcpPort,
                         debugLogs = _debugLogs,
@@ -316,6 +325,7 @@ fun MainScreen(
     tcpClient: TcpClient?,
     transferService: FileTransferService?,
     pathChangedTrigger: Int = 0,
+    resumeCount: Int = 0,
     tcpHost: String,
     tcpPort: String,
     debugLogs: List<String> = emptyList(),
@@ -605,6 +615,7 @@ fun MainScreen(
                             transferService = transferService,
                             triggerRefresh = selectedTab,
                             pathChangedTrigger = pathChangedTrigger,
+                            resumeCount = resumeCount,
                             connectionType = connectionType,
                             onConnectionLost = {
                                 android.util.Log.d("MainActivity", ">>> FileTab: connection lost, triggering reconnect")
