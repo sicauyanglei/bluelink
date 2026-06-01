@@ -303,7 +303,7 @@ class FileTransferService(private val client: TransferClient) {
 
             resolver.openOutputStream(uri)?.use { outputStream ->
                 var totalReceived = offset
-                val buffer = ByteArray(8192)
+                val buffer = ByteArray(131072) // 增大到128KB缓冲区
 
                 while (true) {
                     val response = client.readPacket() ?: return@withContext Result.failure(Exception("连接断开"))
@@ -463,7 +463,7 @@ class FileTransferService(private val client: TransferClient) {
     // Upload file in chunks to avoid OOM for large files
     // Uses streaming upload: header + raw chunks + completion signal
     // Returns total bytes uploaded
-    suspend fun uploadFileChunked(context: Context, uri: android.net.Uri, fileName: String, chunkSize: Int = 32768, onProgress: ((Long, Long) -> Unit)? = null): Result<Long> = withContext(Dispatchers.IO) {
+    suspend fun uploadFileChunked(context: Context, uri: android.net.Uri, fileName: String, chunkSize: Int = 262144, onProgress: ((Long, Long) -> Unit)? = null): Result<Long> = withContext(Dispatchers.IO) { // 增大到256KB分块
         val startTime = System.currentTimeMillis()
         android.util.Log.d("FileTransferService", "=== [UPLOAD CHUNKED] START ===")
         android.util.Log.d("FileTransferService", "=== [UPLOAD CHUNKED] fileName=$fileName")

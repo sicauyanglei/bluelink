@@ -10,43 +10,56 @@ class TcpClient : TransferClient {
         private const val TAG = "TcpClient"
         private const val MAX_RECONNECT_ATTEMPTS = 3
         private const val RECONNECT_DELAY_MS = 2000L
-        private const val HEARTBEAT_INTERVAL_MS = 30000L // 30秒心跳
-        private const val HEARTBEAT_TIMEOUT_MS = 10000L // 10秒超时
+        private const val HEARTBEAT_INTERVAL_MS = 30000L
+        private const val HEARTBEAT_TIMEOUT_MS = 10000L
+        private const val BACKGROUND_RECONNECT_INTERVAL_MS = 5000L
     }
 
     private var socket: Socket? = null
     private var inputStream: InputStream? = null
     private var outputStream: OutputStream? = null
 
-    // Auto-reconnect support
     private var lastHost: String? = null
     private var lastPort: Int? = null
     var onReconnecting: ((attempt: Int) -> Unit)? = null
     var onDisconnected: (() -> Unit)? = null
     var onReconnected: (() -> Unit)? = null
 
-    // 心跳相关
     private var heartBeatJob: kotlinx.coroutines.Job? = null
+    private var backgroundReconnectJob: kotlinx.coroutines.Job? = null
     private var isManuallyDisconnected = false
 
-    override val isConnected: Boolean get() = socket?.isConnected == true
+    private var _isReconnecting = false
+    override val isReconnecting: Boolean get() = _isReconnecting
+
+    override val isConnected: Boolean get() = socket?.isConnected == true && !_isReconnecting
+
+    override val hasConnectionInfo: Boolean get() = lastHost != null && lastPort != null
 
     suspend fun connect(host: String, port: Int): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             socket?.close()
             Log.d(TAG, "connecting to: $host:$port")
-            socket = Socket(host, port)
-            socket?.soTimeout = 30000 // 30 second timeout
+            socket = Socket()
+
+            socket?.apply {
+                tcpNoDelay = true
+                soTimeout = 60000
+                sendBufferSize = 524288
+                receiveBufferSize = 524288
+                keepAlive = true
+            }
+
+            socket?.connect(java.net.InetSocketAddress(host, port), 10000)
+
             inputStream = socket?.getInputStream()
             outputStream = socket?.getOutputStream()
 
-            // Remember for auto-reconnect
             lastHost = host
             lastPort = port
             isManuallyDisconnected = false
 
-            Log.d(TAG, "connected successfully")
-            // 启动心跳
+            Log.d(TAG, "connected successfully with optimized parameters")
             startHeartBeat()
             Result.success(Unit)
         } catch (e: IOException) {
@@ -55,7 +68,6 @@ class TcpClient : TransferClient {
         }
     }
 
-    // Auto-reconnect to the last connected host
     override suspend fun autoReconnect(): Result<Unit> = withContext(Dispatchers.IO) {
         val host = lastHost
         val port = lastPort
@@ -64,25 +76,32 @@ class TcpClient : TransferClient {
             return@withContext Result.failure(Exception("无上次连接信息"))
         }
 
+        _isReconnecting = true
         for (attempt in 1..MAX_RECONNECT_ATTEMPTS) {
             Log.d(TAG, "autoReconnect: attempt $attempt of $MAX_RECONNECT_ATTEMPTS")
             onReconnecting?.invoke(attempt)
 
             try {
-                // Clean up old socket
                 socket?.close()
                 socket = null
                 inputStream = null
                 outputStream = null
 
-                // Create new socket and connect
-                socket = Socket(host, port)
-                socket?.soTimeout = 30000
+                socket = Socket()
+                socket?.apply {
+                    tcpNoDelay = true
+                    soTimeout = 60000
+                    sendBufferSize = 524288
+                    receiveBufferSize = 524288
+                    keepAlive = true
+                }
+                socket?.connect(java.net.InetSocketAddress(host, port), 10000)
+
                 inputStream = socket?.getInputStream()
                 outputStream = socket?.getOutputStream()
 
                 Log.d(TAG, "autoReconnect: success on attempt $attempt")
-                // 启动心跳
+                _isReconnecting = false
                 startHeartBeat()
                 onReconnected?.invoke()
                 return@withContext Result.success(Unit)
@@ -95,14 +114,73 @@ class TcpClient : TransferClient {
             }
         }
 
-        Log.d(TAG, "autoReconnect: all attempts exhausted")
+        Log.d(TAG, "autoReconnect: all attempts exhausted, starting background reconnect")
+        _isReconnecting = false
         onDisconnected?.invoke()
-        Result.failure(Exception("重连失败"))
+        startBackgroundReconnect()
+        Result.failure(Exception("重连失败，后台继续尝试"))
+    }
+
+    private fun startBackgroundReconnect() {
+        stopBackgroundReconnect()
+        if (isManuallyDisconnected || lastHost == null || lastPort == null) return
+
+        Log.d(TAG, "startBackgroundReconnect: starting periodic reconnect")
+        backgroundReconnectJob = kotlinx.coroutines.GlobalScope.launch {
+            while (!isManuallyDisconnected && !isConnected) {
+                delay(BACKGROUND_RECONNECT_INTERVAL_MS)
+                if (isManuallyDisconnected || isConnected) break
+
+                Log.d(TAG, "backgroundReconnect: attempting reconnect...")
+                _isReconnecting = true
+                onReconnecting?.invoke(0)
+
+                try {
+                    val host = lastHost ?: break
+                    val port = lastPort ?: break
+
+                    socket?.close()
+                    socket = null
+                    inputStream = null
+                    outputStream = null
+
+                    withContext(Dispatchers.IO) {
+                        socket = Socket()
+                        socket?.apply {
+                            tcpNoDelay = true
+                            soTimeout = 60000
+                            sendBufferSize = 524288
+                            receiveBufferSize = 524288
+                            keepAlive = true
+                        }
+                        socket?.connect(java.net.InetSocketAddress(host, port), 10000)
+                        inputStream = socket?.getInputStream()
+                        outputStream = socket?.getOutputStream()
+                    }
+
+                    Log.d(TAG, "backgroundReconnect: success!")
+                    _isReconnecting = false
+                    startHeartBeat()
+                    onReconnected?.invoke()
+                    break
+                } catch (e: Exception) {
+                    Log.e(TAG, "backgroundReconnect: failed: ${e.message}")
+                    _isReconnecting = false
+                }
+            }
+        }
+    }
+
+    private fun stopBackgroundReconnect() {
+        backgroundReconnectJob?.cancel()
+        backgroundReconnectJob = null
     }
 
     override fun disconnect() {
         isManuallyDisconnected = true
         stopHeartBeat()
+        stopBackgroundReconnect()
+        _isReconnecting = false
         try {
             socket?.close()
         } catch (e: IOException) { }
@@ -120,13 +198,11 @@ class TcpClient : TransferClient {
                 try {
                     delay(HEARTBEAT_INTERVAL_MS)
                     Log.d(TAG, "sending heartbeat...")
-                    // 发送一个简单的心跳包（比如空数据）
                     writeRaw(byteArrayOf(0x00))
                 } catch (e: Exception) {
                     Log.e(TAG, "heartbeat error: ${e.message}")
                     if (!isManuallyDisconnected) {
                         Log.d(TAG, "heartbeat failed, triggering reconnection...")
-                        // 在协程中异步触发重连，避免阻塞
                         kotlinx.coroutines.GlobalScope.launch {
                             autoReconnect()
                         }
@@ -144,7 +220,6 @@ class TcpClient : TransferClient {
 
     override suspend fun readPacket(): ByteArray? = withContext(Dispatchers.IO) {
         try {
-            // Read 5-byte header
             val header = ByteArray(5)
             val headerRead = inputStream?.read(header) ?: run {
                 handleReadError()
@@ -207,7 +282,6 @@ class TcpClient : TransferClient {
             true
         } catch (e: Exception) {
             android.util.Log.e(TAG, "writePacket error: ${e.javaClass.simpleName}: ${e.message}")
-            // Retry once for transient errors
             try {
                 kotlinx.coroutines.delay(100)
                 val length = data.size
@@ -237,7 +311,6 @@ class TcpClient : TransferClient {
             true
         } catch (e: Exception) {
             Log.e(TAG, "writeRaw error: ${e.javaClass.simpleName}: ${e.message}")
-            // Retry once for transient errors
             try {
                 kotlinx.coroutines.delay(100)
                 outputStream?.write(data)

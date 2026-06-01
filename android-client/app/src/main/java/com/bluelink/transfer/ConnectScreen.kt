@@ -33,6 +33,8 @@ import androidx.compose.ui.unit.sp
 import android.widget.Toast
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -42,8 +44,11 @@ import kotlinx.coroutines.withContext
 fun ConnectScreen(
     onConnected: (TcpClient, FileTransferService) -> Unit,
     onDisconnect: (() -> Unit)? = null,
+    onReconnecting: () -> Unit = {},
+    onReconnected: (TcpClient, FileTransferService) -> Unit = { _, _ -> },
     isConnected: Boolean = false,
     tabVisible: Boolean = false,
+    visible: Boolean = true,
     savedHost: String = "",
     savedPort: String = "9000",
     onHostChange: (String) -> Unit = {},
@@ -67,8 +72,7 @@ fun ConnectScreen(
     var gatewayIP by remember { mutableStateOf<String?>(null) }
 
     // Current TCP client for reconnection support
-    // 使用 isConnected 作为 key 来保持 client 引用不被重组重置
-    var currentTcpClient by remember(isConnected) { mutableStateOf<TcpClient?>(null) }
+    var currentTcpClient by remember { mutableStateOf<TcpClient?>(null) }
 
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -133,30 +137,56 @@ fun ConnectScreen(
             }
         }
     }
+    
+    // 监听网络变化，当网络状态改变时重新扫描
+    var lastNetworkCheck by remember { mutableStateOf(0L) }
+    LaunchedEffect(Unit) {
+        scope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(3000) // 每3秒检查一次网络状态
+                if (tabVisible) {
+                    // 网络状态变化检测（通过检查热点IP是否改变）
+                    val currentIP = HotspotDevices.getHotspotIP()
+                    if (currentIP != null && currentIP != hotspotIP) {
+                        android.util.Log.d("ConnectScreen", "检测到网络变化，旧IP=$hotspotIP，新IP=$currentIP")
+                        hotspotIP = currentIP
+                        gatewayIP = HotspotDevices.getGatewayIP()
+                        status = "检测到网络变化，重新扫描..."
+                        // 如果连接断开，触发重新扫描
+                        if (currentTcpClient?.isConnected == false) {
+                            onDisconnect?.invoke()
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Set up TCP reconnection callbacks
-    LaunchedEffect(currentTcpClient) {
+    DisposableEffect(currentTcpClient) {
         currentTcpClient?.onReconnecting = { attempt ->
             reconnectAttempt = attempt
-            status = "正在重连... ($attempt/3)"
+            isReconnecting = true
+            status = if (attempt == 0) "后台重连中..." else "正在重连... ($attempt/3)"
+            onReconnecting()
+        }
+        currentTcpClient?.onReconnected = {
+            isReconnecting = false
+            status = "重连成功"
+            currentTcpClient?.let { tcpClient ->
+                val transferService = FileTransferService(tcpClient)
+                onReconnected(tcpClient, transferService)
+            }
         }
         currentTcpClient?.onDisconnected = {
             isReconnecting = true
-            scope.launch {
-                val result = currentTcpClient?.autoReconnect()
-                isReconnecting = false
-                if (result?.isSuccess == true) {
-                    status = "重连成功"
-                    currentTcpClient?.let { tcpClient ->
-                        val transferService = FileTransferService(tcpClient)
-                        onConnected(tcpClient, transferService)
-                    }
-                } else {
-                    status = "重连失败"
-                    errorMessage = result?.exceptionOrNull()?.message ?: "未知错误"
-                    showErrorDialog = true
-                }
-            }
+            status = "连接断开，后台重连中..."
+            onReconnecting()
+        }
+        onDispose {
+            currentTcpClient?.onReconnecting = null
+            currentTcpClient?.onReconnected = null
+            currentTcpClient?.onDisconnected = null
         }
     }
 
@@ -203,6 +233,17 @@ fun ConnectScreen(
     }
 
     // Main Layout - Vertical layout optimized for mobile
+    // Use Box with graphicsLayer to control visibility without destroying composition
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .graphicsLayer(alpha = if (visible) 1f else 0f)
+            .then(
+                if (visible) Modifier else Modifier.pointerInput(Unit) {
+                    awaitPointerEventScope { while (true) awaitPointerEvent() }
+                }
+            )
+    ) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -574,5 +615,6 @@ fun ConnectScreen(
             }
             Spacer(modifier = Modifier.height(16.dp))
         }
+    }
     }
 }

@@ -25,6 +25,8 @@ import androidx.compose.ui.platform.LocalLifecycleOwner
 import kotlinx.coroutines.launch
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -40,6 +42,7 @@ class MainActivity : ComponentActivity() {
     private var _refreshTrigger by mutableIntStateOf(0)
     private var _pathChangedTrigger by mutableIntStateOf(0)
     private var _resumeTrigger by mutableIntStateOf(0)
+    private var _connectionStateVersion by mutableIntStateOf(0)
     private var _tcpHost by mutableStateOf("")
     private var _tcpPort by mutableStateOf("9000")
     private var _debugLogs by mutableStateOf<List<String>>(emptyList())
@@ -52,6 +55,7 @@ class MainActivity : ComponentActivity() {
     val pathChangedTrigger get() = _pathChangedTrigger
     val resumeTrigger get() = _resumeTrigger
     val resumeCount get() = _resumeCount
+    val connectionStateVersion get() = _connectionStateVersion
     val tcpHost get() = _tcpHost
     val tcpPort get() = _tcpPort
     val debugLogs get() = _debugLogs
@@ -204,7 +208,25 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         _resumeCount++
+        _connectionStateVersion++
         addDebugLog(">>> MainActivity onResume - resumeCount=$_resumeCount")
+
+        val btClient = _bluetoothClient
+        val tcpCli = _tcpClient
+        val btDisconnected = btClient != null && !btClient.isConnected
+        val tcpDisconnected = tcpCli != null && !tcpCli.isConnected
+
+        if (btDisconnected && tcpDisconnected) {
+            if (btClient?.isReconnecting != true && tcpCli?.isReconnecting != true) {
+                if (btClient?.hasConnectionInfo == true) {
+                    addDebugLog(">>> onResume: 触发蓝牙后台重连")
+                    kotlinx.coroutines.GlobalScope.launch { btClient.autoReconnect() }
+                } else if (tcpCli?.hasConnectionInfo == true) {
+                    addDebugLog(">>> onResume: 触发TCP后台重连")
+                    kotlinx.coroutines.GlobalScope.launch { tcpCli.autoReconnect() }
+                }
+            }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -247,6 +269,7 @@ class MainActivity : ComponentActivity() {
                         transferService = transferService,
                         pathChangedTrigger = _pathChangedTrigger,
                         resumeCount = _resumeCount,
+                        connectionStateVersion = _connectionStateVersion,
                         tcpHost = _tcpHost,
                         tcpPort = _tcpPort,
                         debugLogs = _debugLogs,
@@ -255,6 +278,7 @@ class MainActivity : ComponentActivity() {
                             _bluetoothClient = client
                             _tcpClient = null
                             _transferService = service
+                            _connectionStateVersion++
                             service.onPathChanged = {
                                 _pathChangedTrigger++
                             }
@@ -264,6 +288,7 @@ class MainActivity : ComponentActivity() {
                             _tcpClient = client
                             _bluetoothClient = null
                             _transferService = service
+                            _connectionStateVersion++
                             service.onPathChanged = {
                                 _pathChangedTrigger++
                             }
@@ -275,7 +300,28 @@ class MainActivity : ComponentActivity() {
                             _bluetoothClient = null
                             _tcpClient = null
                             _transferService = null
+                            _connectionStateVersion++
                             addDebugLog("连接已断开")
+                        },
+                        onReconnecting = {
+                            _transferService = null
+                            _connectionStateVersion++
+                            addDebugLog("连接断开，正在重连...")
+                        },
+                        onReconnected = { client, service ->
+                            if (client is TcpClient) {
+                                _tcpClient = client
+                                _bluetoothClient = null
+                            } else if (client is BluetoothClient) {
+                                _bluetoothClient = client
+                                _tcpClient = null
+                            }
+                            _transferService = service
+                            _connectionStateVersion++
+                            service.onPathChanged = {
+                                _pathChangedTrigger++
+                            }
+                            addDebugLog("重连成功")
                         },
                         onTcpHostChange = { _tcpHost = it },
                         onTcpPortChange = { _tcpPort = it },
@@ -326,6 +372,7 @@ fun MainScreen(
     transferService: FileTransferService?,
     pathChangedTrigger: Int = 0,
     resumeCount: Int = 0,
+    connectionStateVersion: Int = 0,
     tcpHost: String,
     tcpPort: String,
     debugLogs: List<String> = emptyList(),
@@ -333,6 +380,8 @@ fun MainScreen(
     onBluetoothConnected: (BluetoothClient, FileTransferService) -> Unit,
     onTcpConnected: (TcpClient, FileTransferService) -> Unit,
     onDisconnect: () -> Unit,
+    onReconnecting: () -> Unit = {},
+    onReconnected: (TransferClient, FileTransferService) -> Unit = { _, _ -> },
     onTcpHostChange: (String) -> Unit,
     onTcpPortChange: (String) -> Unit,
     onToggleDebugLog: () -> Unit = {},
@@ -348,65 +397,38 @@ fun MainScreen(
     // Use key to force reconnect check on resume
     var resumeKey by remember { mutableIntStateOf(0) }
 
-    // Connection status - depends on both resumeKey and actual connection state
-    val isConnected by remember(resumeKey, bluetoothClient?.isConnected, tcpClient?.isConnected) {
-        mutableStateOf(bluetoothClient?.isConnected == true || tcpClient?.isConnected == true)
+    // Connection status - recompute when connectionStateVersion changes
+    val actualBluetoothConnected by remember(connectionStateVersion) {
+        mutableStateOf(bluetoothClient?.isConnected == true)
+    }
+    val actualTcpConnected by remember(connectionStateVersion) {
+        mutableStateOf(tcpClient?.isConnected == true)
+    }
+    val isClientReconnecting = bluetoothClient?.isReconnecting == true || tcpClient?.isReconnecting == true
+    val hasClient = bluetoothClient != null || tcpClient != null
+    val isConnected = actualBluetoothConnected || actualTcpConnected
+
+    val connectionStatus = when {
+        isClientReconnecting -> "正在重连..."
+        actualBluetoothConnected -> "蓝牙已连接"
+        actualTcpConnected -> "TCP已连接"
+        hasClient -> "连接断开，重连中..."
+        else -> "未连接"
     }
 
-    // Connection status for header
-    val connectionStatus by remember(resumeKey, bluetoothClient?.isConnected, tcpClient?.isConnected) {
-        mutableStateOf(when {
-            bluetoothClient?.isConnected == true -> "蓝牙已连接"
-            tcpClient?.isConnected == true -> "TCP已连接"
-            else -> "未连接"
-        })
-    }
-
-    // Connection type for display
-    val connectionType by remember(resumeKey, bluetoothClient?.isConnected, tcpClient?.isConnected) {
-        mutableStateOf(when {
-            bluetoothClient?.isConnected == true -> "蓝牙"
-            tcpClient?.isConnected == true -> "TCP"
-            else -> null
-        })
+    val connectionType: String? = when {
+        actualBluetoothConnected -> "蓝牙"
+        actualTcpConnected -> "TCP"
+        bluetoothClient != null -> "蓝牙"
+        tcpClient != null -> "TCP"
+        else -> null
     }
 
     // Lifecycle observer to detect resume and refresh connection status
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                val toast = { msg: String ->
-                    android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_SHORT).show()
-                }
-
-                // 先刷新 UI 状态
                 resumeKey++
-
-                // 检查客户端连接状态
-                val clientToReconnect = when {
-                    bluetoothClient != null && !bluetoothClient!!.isConnected -> {
-                        toast("蓝牙已断开，正在重连...")
-                        bluetoothClient
-                    }
-                    tcpClient != null && !tcpClient!!.isConnected -> {
-                        toast("TCP已断开，正在重连...")
-                        tcpClient
-                    }
-                    else -> null
-                }
-
-                if (clientToReconnect != null) {
-                    scope.launch {
-                        val result = clientToReconnect.autoReconnect()
-                        if (result.isSuccess) {
-                            toast("重连成功")
-                            resumeKey++
-                        } else {
-                            toast("重连失败")
-                            onDisconnect()
-                        }
-                    }
-                }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -568,78 +590,95 @@ fun MainScreen(
             DeviceScanScreen(
                 bluetoothAdapter = bluetoothAdapter,
                 onConnected = { client, service ->
-                    android.util.Log.d("MainActivity", ">>> onConnected callback: client=$client, service=$service")
                     onBluetoothConnected(client, service)
-                    // Auto switch to file tab after connection
                     selectedTab = 2
-                    android.util.Log.d("MainActivity", ">>> onBluetoothConnected done")
                 },
                 onDisconnect = {
                     onDisconnect()
-                    // Switch back to Bluetooth tab when disconnected
                     selectedTab = 0
+                },
+                onReconnecting = onReconnecting,
+                onReconnected = { client, service ->
+                    onReconnected(client, service)
                 },
                 isConnected = bluetoothClient?.isConnected == true,
                 visible = selectedTab == 0
             )
 
-            // TCP Tab - always composed
-            if (selectedTab == 1) {
-                ConnectScreen(
-                    onConnected = { client, service ->
-                        onTcpConnected(client, service)
-                        // Auto switch to file tab after connection
-                        selectedTab = 2
-                    },
-                    onDisconnect = {
-                        onDisconnect()
-                        // Switch back to TCP tab when disconnected
-                        selectedTab = 1
-                    },
-                    isConnected = tcpClient?.isConnected == true,
-                    tabVisible = selectedTab == 1,
-                    savedHost = tcpHost,
-                    savedPort = tcpPort,
-                    onHostChange = onTcpHostChange,
-                    onPortChange = onTcpPortChange
-                )
-            }
+            // TCP Tab - always composed, just hidden when not selected
+            ConnectScreen(
+                onConnected = { client, service ->
+                    onTcpConnected(client, service)
+                    selectedTab = 2
+                },
+                onDisconnect = {
+                    onDisconnect()
+                    selectedTab = 1
+                },
+                onReconnecting = onReconnecting,
+                onReconnected = { client, service ->
+                    onReconnected(client, service)
+                },
+                isConnected = tcpClient?.isConnected == true,
+                tabVisible = selectedTab == 1,
+                visible = selectedTab == 1,
+                savedHost = tcpHost,
+                savedPort = tcpPort,
+                onHostChange = onTcpHostChange,
+                onPortChange = onTcpPortChange
+            )
 
-            // File Tab - always composed
-            if (selectedTab == 2) {
+            // File Tab - always composed, just hidden when not selected
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer(alpha = if (selectedTab == 2) 1f else 0f)
+                    .then(
+                        if (selectedTab == 2) Modifier else Modifier.pointerInput(Unit) {
+                            awaitPointerEventScope { while (true) awaitPointerEvent() }
+                        }
+                    )
+            ) {
                 if (isConnected && transferService != null) {
                     val client = tcpClient ?: bluetoothClient
                     if (client != null) {
                         FileListScreen(
                             client = client,
                             transferService = transferService,
-                            triggerRefresh = selectedTab,
+                            triggerRefresh = selectedTab + connectionStateVersion,
                             pathChangedTrigger = pathChangedTrigger,
                             resumeCount = resumeCount,
                             connectionType = connectionType,
                             onConnectionLost = {
-                                android.util.Log.d("MainActivity", ">>> FileTab: connection lost, triggering reconnect")
-                                scope.launch {
-                                    val result = client.autoReconnect()
-                                    android.util.Log.d("MainActivity", ">>> FileTab: reconnect result=${result.isSuccess}")
-                                    if (result.isSuccess) {
-                                        // 重连成功，刷新文件列表
-                                        android.util.Log.d("MainActivity", ">>> FileTab: 重连成功，刷新文件列表")
-                                        onTriggerPathRefresh()
-                                        resumeKey++
-                                    } else {
-                                        // 重连失败，切换到对应标签页
-                                        android.util.Log.d("MainActivity", ">>> FileTab: 重连失败，切换标签")
-                                        onDisconnect()
-                                        if (client is BluetoothClient) {
-                                            selectedTab = 0
-                                        } else {
-                                            selectedTab = 1
-                                        }
-                                    }
-                                }
+                                onReconnecting()
                             },
                         )
+                    }
+                } else if (hasClient) {
+                    Box(
+                        modifier = Modifier.fillMaxSize(),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(48.dp),
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text(
+                                text = if (isClientReconnecting) "正在重连..." else "连接断开，后台重连中...",
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = "请稍候，将自动恢复连接",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                            )
+                        }
                     }
                 } else {
                     Box(
