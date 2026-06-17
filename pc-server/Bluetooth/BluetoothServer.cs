@@ -2,6 +2,7 @@ using System.Diagnostics;
 using InTheHand.Net.Bluetooth;
 using InTheHand.Net.Sockets;
 using System.IO;
+using BluetoothFileServer.Services;
 
 namespace BluetoothFileServer.Bluetooth;
 
@@ -37,38 +38,24 @@ public class BluetoothServer : IDisposable
 
             try
             {
-                // Get the Bluetooth radio
                 var radio = BluetoothRadio.PrimaryRadio;
                 if (radio != null)
                 {
                     Debug.WriteLine($"Bluetooth Radio: {radio.Name}");
-                    Debug.WriteLine($"Local Address: {radio.LocalAddress}");
-                    Debug.WriteLine($"Current Mode: {radio.Mode}");
-                    // Note: Setting radio mode to discoverable requires Windows Bluetooth settings
-                    // or using native Win32 API. InTheHand library may not support this directly.
                 }
 
-                // Create Bluetooth listener for our service UUID
                 _listener = new BluetoothListener(ServiceUuid);
                 _listener.ServiceName = "BluetoothFileServer";
-
-                Debug.WriteLine($"Starting listener with UUID: {ServiceUuid}");
                 _listener.Start();
-                Debug.WriteLine("Listener started successfully");
-
-                // Wait a bit for listener to be ready
-                Thread.Sleep(500);
 
                 _isRunning = true;
                 ConnectionStatusChanged?.Invoke(this, $"蓝牙服务已启动，UUID={ServiceUuid}\n正在等待连接...");
 
-                // Start accepting clients in background
                 Task.Run(() => AcceptClientsAsync(_cts.Token), _cts.Token);
             }
             catch (Exception ex)
             {
                 ConnectionStatusChanged?.Invoke(this, $"启动失败: {ex.Message}");
-                Debug.WriteLine($"Bluetooth server error: {ex}");
                 _isRunning = false;
             }
         }
@@ -83,17 +70,7 @@ public class BluetoothServer : IDisposable
         }
 
         _cts?.Cancel();
-
-        try
-        {
-            _listener?.Stop();
-            _listener = null;
-        }
-        catch (Exception ex)
-        {
-            Debug.WriteLine($"Stop error: {ex.Message}");
-        }
-
+        try { _listener?.Stop(); _listener = null; } catch { }
         _cts?.Dispose();
         _cts = null;
 
@@ -106,37 +83,23 @@ public class BluetoothServer : IDisposable
         {
             try
             {
-                LogToFile("[AcceptClients] Waiting for Bluetooth connection...");
                 ConnectionStatusChanged?.Invoke(this, "正在等待蓝牙连接...");
-                // Accept waiting client - this is blocking so run in Task
                 var client = await Task.Run(() => _listener.AcceptBluetoothClient(), token);
 
-                LogToFile($"[AcceptClients] Client accepted: {client.RemoteMachineName ?? "Unknown"}");
                 ConnectionStatusChanged?.Invoke(this, "客户端已连接!");
                 var connectedClient = new BluetoothConnectedClient(client);
                 ClientConnected?.Invoke(this, new ClientConnectionEventArgs(connectedClient));
             }
-            catch (OperationCanceledException)
-            {
-                LogToFile("[AcceptClients] Cancelled");
-                break;
-            }
+            catch (OperationCanceledException) { break; }
             catch (Exception ex)
             {
-                LogToFile($"[AcceptClients] Exception: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
-                ConnectionStatusChanged?.Invoke(this, $"接受连接异常: {ex.Message}\n{ex.GetType().Name}");
-                if (!token.IsCancellationRequested)
-                {
-                    await Task.Delay(1000, token);
-                }
+                ConnectionStatusChanged?.Invoke(this, $"接受连接异常: {ex.Message}");
+                if (!token.IsCancellationRequested) await Task.Delay(1000, token);
             }
         }
     }
 
-    public void Dispose()
-    {
-        StopServer();
-    }
+    public void Dispose() => StopServer();
 
     private static void LogToFile(string message)
     {
@@ -147,7 +110,7 @@ public class BluetoothServer : IDisposable
                 Directory.CreateDirectory(logDir);
             var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff");
             var logLine = $"[{timestamp}] {message}{Environment.NewLine}";
-            File.AppendAllText(LogFilePath, logLine);
+            AsyncLogger.Append(LogFilePath, logLine);
             Debug.WriteLine(logLine);
         }
         catch { }
@@ -160,56 +123,64 @@ public class ClientConnectionEventArgs : EventArgs
     public ClientConnectionEventArgs(BluetoothConnectedClient client) => Client = client;
 }
 
-public class BluetoothConnectedClient
+public class BluetoothConnectedClient : ITransferClient
 {
     private readonly BluetoothClient _client;
+    private Stream? _stream;
+    private const int ReadTimeoutMs = 120000; // 2 分钟
 
-    public string DeviceName {
-        get {
-            try {
-                return _client.RemoteMachineName ?? "Unknown Device";
-            } catch (Exception ex) {
-                Debug.WriteLine($"[BluetoothConnectedClient] RemoteMachineName error: {ex.Message}");
-                return "Unknown Device";
-            }
+    public string DeviceName
+    {
+        get
+        {
+            try { return _client.RemoteMachineName ?? "Unknown Device"; }
+            catch { return "Unknown Device"; }
         }
     }
-    public string DeviceAddress => "Connected";
+
+    // P0-4: 暴露真实地址
+    public string DeviceAddress
+    {
+        get
+        {
+            try { return _client.RemoteMachineAddress?.ToString() ?? "Connected"; }
+            catch { return "Connected"; }
+        }
+    }
 
     public BluetoothConnectedClient(BluetoothClient client)
     {
         _client = client;
     }
 
-    public System.IO.Stream GetStream() => _client.GetStream();
+    private Stream GetStreamInternal()
+    {
+        if (_stream == null) _stream = _client.GetStream();
+        return _stream;
+    }
 
+    /// <summary>
+    /// 修复 P0-4：用 CancellationTokenSource 替代 Thread.Sleep，避免线程泄漏
+    /// </summary>
     public async Task<int> ReadAsync(byte[] buffer, int offset, int count)
     {
         try
         {
-            var stream = _client.GetStream();
-
-            // Use a timeout to prevent blocking forever
-            // 120 seconds (2 minutes) to allow large file transfers over Bluetooth
-            var timeoutTask = Task.Run(() => {
-                Thread.Sleep(120000); // 120 second timeout
-                return -1;
-            });
-
-            var readTask = stream.ReadAsync(buffer, offset, count);
-            var completedTask = await Task.WhenAny(readTask, timeoutTask);
-
-            if (completedTask == timeoutTask)
+            var stream = GetStreamInternal();
+            using var cts = new CancellationTokenSource(ReadTimeoutMs);
+            try
             {
-                Debug.WriteLine($"[BluetoothConnectedClient] ReadAsync timeout after 120s");
+                return await stream.ReadAsync(buffer, offset, count, cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                Debug.WriteLine("[BluetoothConnectedClient] ReadAsync timeout");
                 return -1;
             }
-
-            return await readTask;
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"[BluetoothConnectedClient] ReadAsync error: {ex.GetType().Name}: {ex.Message}");
+            Debug.WriteLine($"[BluetoothConnectedClient] ReadAsync error: {ex.Message}");
             return 0;
         }
     }
@@ -218,21 +189,20 @@ public class BluetoothConnectedClient
     {
         try
         {
-            var stream = _client.GetStream();
+            var stream = GetStreamInternal();
             await stream.WriteAsync(buffer, offset, count);
             await stream.FlushAsync();
         }
-        catch
+        catch (Exception ex)
         {
+            Debug.WriteLine($"[BluetoothConnectedClient] WriteAsync error: {ex.Message}");
+            throw;
         }
     }
 
     public void Close()
     {
-        try
-        {
-            _client.Close();
-        }
-        catch { }
+        try { _stream?.Close(); } catch { }
+        try { _client.Close(); } catch { }
     }
 }

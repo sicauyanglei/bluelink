@@ -63,7 +63,7 @@ fun ConnectScreen(
     var isScanningHotspot by remember { mutableStateOf(false) }
     var isReconnecting by remember { mutableStateOf(false) }
     var reconnectAttempt by remember { mutableStateOf(0) }
-    var hotspotDevices by remember { mutableStateOf<List<HotspotDevices.Device>>(emptyList()) }
+    var hotspotDevices by remember { mutableStateOf<List<NetworkScanner.Device>>(emptyList()) }
     var showErrorDialog by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf("") }
     var debugLogs by remember { mutableStateOf<List<String>>(emptyList()) }
@@ -80,8 +80,8 @@ fun ConnectScreen(
 
     // 设置调试日志回调和Context（同步快速）
     LaunchedEffect(Unit) {
-        HotspotDevices.setContext(context)
-        HotspotDevices.debugLog = { log ->
+        NetworkScanner.setContext(context)
+        NetworkScanner.debugLog = { log ->
             debugLogs = (debugLogs + log).takeLast(50)
         }
     }
@@ -92,8 +92,8 @@ fun ConnectScreen(
         if (tabVisible) {
             scope.launch {
                 // 异步检测热点IP
-                hotspotIP = HotspotDevices.getHotspotIP()
-                gatewayIP = HotspotDevices.getGatewayIP()
+                hotspotIP = NetworkScanner.getHotspotIP()
+                gatewayIP = NetworkScanner.getGatewayIP()
 
                 // 只扫描热点IP所在的子网
                 val currentHotspotIP = hotspotIP
@@ -102,7 +102,7 @@ fun ConnectScreen(
                     if (parts.size == 4) {
                         val subnet = "${parts[0]}.${parts[1]}.${parts[2]}"
                         debugLogs = (debugLogs + "扫描子网: $subnet.x").takeLast(50)
-                        hotspotDevices = HotspotDevices.scanSubnet(subnet)
+                        hotspotDevices = NetworkScanner.scanSubnet(subnet)
                         if (hotspotDevices.isNotEmpty()) {
                             status = "发现 ${hotspotDevices.size} 个设备"
 
@@ -146,11 +146,11 @@ fun ConnectScreen(
                 kotlinx.coroutines.delay(3000) // 每3秒检查一次网络状态
                 if (tabVisible) {
                     // 网络状态变化检测（通过检查热点IP是否改变）
-                    val currentIP = HotspotDevices.getHotspotIP()
+                    val currentIP = NetworkScanner.getHotspotIP()
                     if (currentIP != null && currentIP != hotspotIP) {
                         android.util.Log.d("ConnectScreen", "检测到网络变化，旧IP=$hotspotIP，新IP=$currentIP")
                         hotspotIP = currentIP
-                        gatewayIP = HotspotDevices.getGatewayIP()
+                        gatewayIP = NetworkScanner.getGatewayIP()
                         status = "检测到网络变化，重新扫描..."
                         // 如果连接断开，触发重新扫描
                         if (currentTcpClient?.isConnected == false) {
@@ -583,7 +583,7 @@ fun ConnectScreen(
                                 discoveredIPs.addAll(scanResults.map { it.ip })
 
                                 // Also check gateway
-                                val gateway = HotspotDevices.getGatewayIP()
+                                val gateway = NetworkScanner.getGatewayIP()
                                 if (gateway != null && isServerReachable(gateway)) {
                                     discoveredIPs.add(gateway)
                                 }

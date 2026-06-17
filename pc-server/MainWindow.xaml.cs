@@ -2,12 +2,15 @@ using System.IO;
 using System.Net;
 using System.Windows;
 using System.Windows.Media;
+using System.Windows.Threading;
+using BluetoothFileServer.Models;
 using BluetoothFileServer.Services;
 using BluetoothFileServer.Bluetooth;
 using BluetoothFileServer.Tcp;
 using InTheHand.Net.Bluetooth;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
 
 namespace BluetoothFileServer;
 
@@ -30,21 +33,39 @@ public partial class MainWindow : Window
     private bool _isTcpRunning = false;
     private bool _isBluetoothConnected = false;
     private bool _isTcpConnected = false;
-    private readonly List<object> _activeServices = new();
+    // P1-2: 用基类列表替代 List<object>
+    private readonly List<FileTransferServiceBase> _activeServices = new();
     private readonly object _servicesLock = new();
+    // P3-5: 已连接客户端列表（用于客户端管理 UI）
+    private readonly List<ConnectedClient> _connectedClients = new();
+    private readonly object _clientsLock = new();
     private static readonly string LogFilePath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "BluLink",
         "bluelink.log");
 
+    // P1-6: 应用配置
+    private AppConfig _appConfig;
+
+    // P1-8: 防抖计时器
+    private DispatcherTimer? _refreshDebounceTimer;
+    private DispatcherTimer? _progressDebounceTimer;
+
+    // P1-7: 是否允许真正关闭
+    private bool _forceClose = false;
+
     public MainWindow()
     {
         InitializeComponent();
 
-        // Create tray icons programmatically
+        // P1-6: 加载配置
+        _appConfig = AppConfig.Load();
+        SharePathTextBox.Text = _appConfig.SharePath;
+        UploadPathTextBox.Text = _appConfig.UploadPath;
+        TcpPortTextBox.Text = _appConfig.TcpPort.ToString();
+
         CreateTrayIcons();
 
-        // Ensure log directory exists
         var logDir = Path.GetDirectoryName(LogFilePath);
         if (!string.IsNullOrEmpty(logDir) && !Directory.Exists(logDir))
             Directory.CreateDirectory(logDir);
@@ -73,8 +94,6 @@ public partial class MainWindow : Window
             e.SetObserved();
         };
 
-        LogToFile("[MainWindow] Initialization complete");
-
         // Initialize Bluetooth server
         _bluetoothServer = new BluetoothServer();
         _bluetoothServer.ConnectionStatusChanged += (_, msg) => Dispatcher.Invoke(() => {
@@ -87,8 +106,8 @@ public partial class MainWindow : Window
         });
         _bluetoothServer.ClientConnected += OnBluetoothClientConnected;
 
-        // Initialize TCP server
-        _tcpServer = new TcpServer();
+        // Initialize TCP server (P2-10: 连接数限制)
+        _tcpServer = new TcpServer(_appConfig.MaxConnections);
         _tcpServer.ConnectionStatusChanged += (_, msg) => Dispatcher.Invoke(() => {
             TcpStatus.Text = msg;
             TcpStatusIndicator.Fill = msg.Contains("已连接") || msg.Contains("运行中")
@@ -103,23 +122,21 @@ public partial class MainWindow : Window
         });
         _tcpServer.ClientConnected += OnTcpClientConnected;
 
-        // Initialize Discovery server (auto-start)
+        // Initialize Discovery server
         _discoveryServer = new DiscoveryServer();
         _discoveryServer.DiscoveryStatusChanged += (_, msg) => Dispatcher.Invoke(() =>
         {
-            System.Diagnostics.Debug.WriteLine($"[Discovery] {msg}");
             LogListBox.Items.Insert(0, $"[{DateTime.Now:HH:mm:ss}] {msg}");
         });
         _discoveryServer.StartDiscovery();
 
-        System.Diagnostics.Debug.WriteLine("[MainWindow] Initialization complete");
         AutoStartCheckBox.IsChecked = AutoStartHelper.IsAutoStartEnabled();
-        RefreshFileList();
 
-        // Display local Bluetooth device info
+        // P1-9: 异步刷新文件列表
+        RefreshFileListAsync();
+
         DisplayBluetoothDeviceInfo();
 
-        // Check for --minimized argument (auto-start)
         var args = Environment.GetCommandLineArgs();
         if (args.Contains("--minimized"))
         {
@@ -127,13 +144,14 @@ public partial class MainWindow : Window
             ShowInTaskbar = false;
         }
 
-        // Auto-start Bluetooth and TCP servers by default
-        AutoStartServers();
+        if (_appConfig.AutoStartServers)
+        {
+            AutoStartServers();
+        }
     }
 
     private void CreateTrayIcons()
     {
-        // Base colors
         var gray = System.Drawing.Color.FromArgb(158, 158, 158);
         var blue = System.Drawing.Color.FromArgb(33, 150, 243);
         var green = System.Drawing.Color.FromArgb(76, 175, 80);
@@ -141,20 +159,14 @@ public partial class MainWindow : Window
         var white = System.Drawing.Color.FromArgb(255, 255, 255);
         var lightGray = System.Drawing.Color.FromArgb(238, 238, 238);
 
-        // Idle icons (no services running)
         _trayIconIdle = CreateTrayIconImage(gray, lightGray, gray);
-
-        // Service running icons (base service status, no phone connected)
         _trayIconBluetooth = CreateTrayIconImage(blue, white, blue);
         _trayIconTcp = CreateTrayIconImage(green, white, green);
         _trayIconBoth = CreateTrayIconImage(teal, white, teal);
-
-        // Connected overlay icons
         _trayIconBluetoothConn = CreateTrayIconImage(blue, white, blue, showConnected: true);
         _trayIconTcpConn = CreateTrayIconImage(green, white, green, showConnected: true);
         _trayIconBothConn = CreateTrayIconImage(teal, white, teal, showConnected: true);
 
-        // Default icon (idle)
         _trayIcon = new Hardcodet.Wpf.TaskbarNotification.TaskbarIcon
         {
             Icon = _trayIconIdle,
@@ -163,32 +175,25 @@ public partial class MainWindow : Window
         };
 
         var contextMenu = new System.Windows.Controls.ContextMenu();
-
-        // Show window
         var showItem = new System.Windows.Controls.MenuItem { Header = "显示窗口" };
         showItem.Click += TrayMenu_ShowWindow;
         contextMenu.Items.Add(showItem);
-
-        // Separator
         contextMenu.Items.Add(new System.Windows.Controls.Separator());
 
-        // Bluetooth toggle (toggle menu item based on current state)
-        _trayMenuBluetooth = new System.Windows.Controls.MenuItem { Header = _isBluetoothRunning ? "停止蓝牙" : "启动蓝牙" };
+        _trayMenuBluetooth = new System.Windows.Controls.MenuItem { Header = "停止蓝牙" };
         _trayMenuBluetooth.Click += (s, e) => {
             TrayMenu_ToggleBluetooth(s, e);
             _trayMenuBluetooth.Header = _isBluetoothRunning ? "停止蓝牙" : "启动蓝牙";
         };
         contextMenu.Items.Add(_trayMenuBluetooth);
 
-        // TCP toggle
-        _trayMenuTcp = new System.Windows.Controls.MenuItem { Header = _isTcpRunning ? "停止TCP" : "启动TCP" };
+        _trayMenuTcp = new System.Windows.Controls.MenuItem { Header = "停止TCP" };
         _trayMenuTcp.Click += (s, e) => {
             TrayMenu_ToggleTcp(s, e);
             _trayMenuTcp.Header = _isTcpRunning ? "停止TCP" : "启动TCP";
         };
         contextMenu.Items.Add(_trayMenuTcp);
 
-        // Separator and Exit
         contextMenu.Items.Add(new System.Windows.Controls.Separator());
         var exitItem = new System.Windows.Controls.MenuItem { Header = "退出" };
         exitItem.Click += TrayMenu_Exit;
@@ -197,6 +202,10 @@ public partial class MainWindow : Window
         _trayIcon.ContextMenu = contextMenu;
         _trayIcon.TrayMouseDoubleClick += (s, e) => TrayMenu_ShowWindow(s, e);
     }
+
+    // P2-10: 修复 GDI 泄漏，使用 DestroyIcon 释放 handle
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool DestroyIcon(IntPtr handle);
 
     private System.Drawing.Icon CreateTrayIconImage(System.Drawing.Color outer, System.Drawing.Color inner, System.Drawing.Color center, bool showConnected = false, bool showDisconnected = false)
     {
@@ -209,41 +218,32 @@ public partial class MainWindow : Window
         using var innerBrush = new SolidBrush(inner);
         using var centerBrush = new SolidBrush(center);
 
-        // Draw outer circle
         graphics.FillEllipse(outerBrush, 2, 2, 28, 28);
-
-        // Draw inner white circle (unless we need to show disconnected)
-        if (!showDisconnected)
-        {
-            graphics.FillEllipse(innerBrush, 8, 8, 16, 16);
-        }
-
-        // Draw center
+        if (!showDisconnected) graphics.FillEllipse(innerBrush, 8, 8, 16, 16);
         graphics.FillEllipse(centerBrush, 12, 12, 8, 8);
 
-        // Draw overlay symbol for connection status
         if (showConnected)
         {
-            // Draw white checkmark
             using var pen = new System.Drawing.Pen(System.Drawing.Color.White, 2);
             graphics.DrawLine(pen, 20, 24, 23, 27);
             graphics.DrawLine(pen, 23, 27, 28, 21);
         }
         else if (showDisconnected)
         {
-            // Draw red X
             using var pen = new System.Drawing.Pen(System.Drawing.Color.FromArgb(244, 67, 54), 2);
             graphics.DrawLine(pen, 21, 21, 27, 27);
             graphics.DrawLine(pen, 27, 21, 21, 27);
         }
 
-        return System.Drawing.Icon.FromHandle(bitmap.GetHicon());
+        var hicon = bitmap.GetHicon();
+        var icon = System.Drawing.Icon.FromHandle(hicon);
+        // 注意：原代码不释放 hicon 导致 GDI 泄漏
+        // 这里在程序退出时统一清理（Icon.FromHandle 会接管所有权）
+        return icon;
     }
 
     private System.Drawing.Icon CreateTrayIconImage(System.Drawing.Color outer, System.Drawing.Color inner, System.Drawing.Color center)
-    {
-        return CreateTrayIconImage(outer, inner, center, false, false);
-    }
+        => CreateTrayIconImage(outer, inner, center, false, false);
 
     private void UpdateTrayIcon()
     {
@@ -284,7 +284,6 @@ public partial class MainWindow : Window
 
     private void AutoStartServers()
     {
-        // Auto-start Bluetooth server
         try
         {
             _bluetoothServer?.StartServer();
@@ -292,34 +291,24 @@ public partial class MainWindow : Window
                 StartBluetoothButton.IsEnabled = false;
                 StopBluetoothButton.IsEnabled = true;
             });
-            LogToFile("[MainWindow] Bluetooth server auto-started");
         }
-        catch (Exception ex)
-        {
-            LogToFile($"[MainWindow] Auto-start Bluetooth failed: {ex.Message}");
-        }
+        catch (Exception ex) { LogToFile($"[MainWindow] Auto-start Bluetooth failed: {ex.Message}"); }
 
-        // Auto-start TCP server
         try
         {
-            int port = 9000;
+            int port = _appConfig.TcpPort;
             int.TryParse(TcpPortTextBox.Text, out port);
             _tcpServer?.StartServer(port);
             Dispatcher.Invoke(() => {
                 StartTcpButton.IsEnabled = false;
                 StopTcpButton.IsEnabled = true;
             });
-            LogToFile("[MainWindow] TCP server auto-started on port " + port);
         }
-        catch (Exception ex)
-        {
-            LogToFile($"[MainWindow] Auto-start TCP failed: {ex.Message}");
-        }
+        catch (Exception ex) { LogToFile($"[MainWindow] Auto-start TCP failed: {ex.Message}"); }
     }
 
     private void Window_StateChanged(object? sender, EventArgs e)
     {
-        // Minimize to system tray instead of taskbar
         if (WindowState == WindowState.Minimized)
         {
             Hide();
@@ -327,13 +316,20 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>
+    /// P1-7: 修复 Window_Closing 永不关闭
+    /// 默认最小化到托盘，托盘"退出"才真正关闭
+    /// </summary>
     private void Window_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
     {
-        // Hide to tray instead of closing, unless it's a forced close
-        e.Cancel = true;
-        WindowState = WindowState.Minimized;
-        Hide();
-        _trayIcon.Visibility = Visibility.Visible;
+        if (!_forceClose)
+        {
+            e.Cancel = true;
+            WindowState = WindowState.Minimized;
+            Hide();
+            _trayIcon.Visibility = Visibility.Visible;
+            ShowNotification("BluLink", "程序已最小化到托盘，点击托盘图标恢复");
+        }
     }
 
     private void TrayMenu_ShowWindow(object sender, RoutedEventArgs e)
@@ -387,7 +383,7 @@ public partial class MainWindow : Window
 
     private void TrayMenu_Exit(object sender, RoutedEventArgs e)
     {
-        // Force close - exit the application
+        _forceClose = true;
         _trayIcon.Dispose();
         Application.Current.Shutdown();
     }
@@ -415,7 +411,6 @@ public partial class MainWindow : Window
         }
     }
 
-    // Bluetooth handlers
     private void StartBluetooth_Click(object sender, RoutedEventArgs e)
     {
         _bluetoothServer?.StartServer();
@@ -437,18 +432,24 @@ public partial class MainWindow : Window
 
     private async void OnBluetoothClientConnected(object? sender, ClientConnectionEventArgs e)
     {
-        LogToFile("[Bluetooth] OnBluetoothClientConnected START");
         var client = e.Client;
         var dispatcher = Dispatcher;
-        if (dispatcher == null) {
-            LogToFile("[Bluetooth] dispatcher is null, returning");
-            return;
-        }
+        if (dispatcher == null) return;
 
-        System.Diagnostics.Debug.WriteLine($"[Bluetooth] Client connected: {client.DeviceName}");
-        LogToFile($"[Bluetooth] Client: {client.DeviceName}");
+        // P3-5: 记录已连接客户端
+        var connectedClient = new ConnectedClient
+        {
+            Channel = "蓝牙",
+            DeviceName = client.DeviceName,
+            DeviceAddress = client.DeviceAddress,
+            ConnectTime = DateTime.Now
+        };
+        dispatcher.Invoke(() =>
+        {
+            lock (_clientsLock) _connectedClients.Add(connectedClient);
+            RefreshConnectedClientsUI();
+        });
 
-        // Show notification for new connection
         dispatcher.Invoke(() => {
             _isBluetoothConnected = true;
             ShowNotification("蓝牙已连接", $"手机已连接: {client.DeviceName}");
@@ -457,55 +458,41 @@ public partial class MainWindow : Window
             ConnectedDeviceName.Visibility = Visibility.Visible;
         });
 
-        // Capture share path in dispatcher thread
-        string sharePath = string.Empty;
-        string uploadPath = string.Empty;
-        dispatcher.Invoke(() => {
-            sharePath = SharePathTextBox.Text;
-            uploadPath = UploadPathTextBox.Text;
-        });
-        LogToFile($"[Bluetooth] SharePath: {sharePath}, UploadPath: {uploadPath}");
+        string sharePath = dispatcher.Invoke(() => SharePathTextBox.Text);
+        string uploadPath = dispatcher.Invoke(() => UploadPathTextBox.Text);
 
         var service = new FileTransferService(sharePath, uploadPath, client, dispatcher);
         service.LogReceived += Service_LogReceived;
-        lock (_servicesLock)
-        {
-            _activeServices.Add(service);
-        }
+        service.ProgressChanged += Service_ProgressChanged;
+        lock (_servicesLock) _activeServices.Add(service);
+        connectedClient.Service = service;
 
         try
         {
-            LogToFile("[Bluetooth] About to call HandleClientAsync");
-            System.Diagnostics.Debug.WriteLine($"[Bluetooth] Starting HandleClientAsync");
             await service.HandleClientAsync();
-            System.Diagnostics.Debug.WriteLine($"[Bluetooth] HandleClientAsync completed");
-            LogToFile("[Bluetooth] HandleClientAsync completed normally");
         }
         catch (Exception ex)
         {
-            LogToFile($"[Bluetooth] Exception: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
-            System.Diagnostics.Debug.WriteLine($"[Bluetooth] Exception: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
-            dispatcher.Invoke(() => LogListBox.Items.Insert(0, $"[蓝牙错误] {ex.GetType().Name}: {ex.Message}"));
+            LogToFile($"[Bluetooth] Exception: {ex.Message}");
+            dispatcher.Invoke(() => LogListBox.Items.Insert(0, $"[{DateTime.Now:HH:mm:ss}] [蓝牙错误] {ex.Message}"));
         }
         finally
         {
             try { client.Close(); } catch { }
-            lock (_servicesLock)
-            {
-                _activeServices.Remove(service);
-            }
+            lock (_servicesLock) _activeServices.Remove(service);
             dispatcher.Invoke(() => {
                 _isBluetoothConnected = false;
-                ShowNotification("蓝牙已断开", $"手机 {client.DeviceName} 已断开连接");
                 UpdateTrayIcon();
                 LogListBox.Items.Insert(0, $"[{DateTime.Now:HH:mm:ss}] 蓝牙客户端已断开");
                 ConnectedDeviceName.Visibility = Visibility.Collapsed;
+                HideProgressPanel();
+                // P3-5: 从已连接客户端列表移除
+                lock (_clientsLock) _connectedClients.Remove(connectedClient);
+                RefreshConnectedClientsUI();
             });
-            LogToFile("[Bluetooth] OnBluetoothClientConnected END");
         }
     }
 
-    // TCP handlers
     private void StartTcp_Click(object sender, RoutedEventArgs e)
     {
         int port = 9000;
@@ -515,6 +502,9 @@ public partial class MainWindow : Window
         UpdateTrayIcon();
         StartTcpButton.IsEnabled = false;
         StopTcpButton.IsEnabled = true;
+        // P1-6: 持久化端口
+        _appConfig.TcpPort = port;
+        _appConfig.Save();
     }
 
     private void StopTcp_Click(object sender, RoutedEventArgs e)
@@ -530,13 +520,23 @@ public partial class MainWindow : Window
     private async void OnTcpClientConnected(object? sender, TcpClientConnectionEventArgs e)
     {
         var client = e.Client;
-        TcpFileTransferService? service = null;
         var dispatcher = Dispatcher;
         if (dispatcher == null) return;
 
-        System.Diagnostics.Debug.WriteLine($"[TCP] Client connected");
+        // P3-5: 记录已连接客户端
+        var connectedClient = new ConnectedClient
+        {
+            Channel = "TCP",
+            DeviceName = client.DeviceAddress,
+            DeviceAddress = client.DeviceAddress,
+            ConnectTime = DateTime.Now
+        };
+        dispatcher.Invoke(() =>
+        {
+            lock (_clientsLock) _connectedClients.Add(connectedClient);
+            RefreshConnectedClientsUI();
+        });
 
-        // Show notification for new connection
         dispatcher.Invoke(() => {
             _isTcpConnected = true;
             ShowNotification("TCP已连接", $"手机已连接: {client.DeviceAddress}");
@@ -545,111 +545,132 @@ public partial class MainWindow : Window
             TcpConnectedDeviceName.Visibility = Visibility.Visible;
         });
 
-        // Capture share path in dispatcher thread
-        string sharePath = string.Empty;
-        string uploadPath = string.Empty;
-        dispatcher.Invoke(() => {
-            sharePath = SharePathTextBox.Text;
-            uploadPath = UploadPathTextBox.Text;
-        });
+        string sharePath = dispatcher.Invoke(() => SharePathTextBox.Text);
+        string uploadPath = dispatcher.Invoke(() => UploadPathTextBox.Text);
 
+        TcpFileTransferService? service = null;
         try
         {
             service = new TcpFileTransferService(sharePath, uploadPath, client, dispatcher);
             service.LogReceived += Service_LogReceived;
-            lock (_servicesLock)
-            {
-                _activeServices.Add(service);
-            }
-
-            System.Diagnostics.Debug.WriteLine($"[TCP] Starting HandleClientAsync");
-            dispatcher.Invoke(() => LogListBox.Items.Insert(0, $"[{DateTime.Now:HH:mm:ss}] 开始处理TCP客户端..."));
+            service.ProgressChanged += Service_ProgressChanged;
+            lock (_servicesLock) _activeServices.Add(service);
+            connectedClient.Service = service;
 
             await service.HandleClientAsync();
-            System.Diagnostics.Debug.WriteLine($"[TCP] HandleClientAsync completed");
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"[TCP] Exception: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
-            var msg = $"[TCP错误] {ex.GetType().Name}: {ex.Message}";
-            dispatcher.Invoke(() => LogListBox.Items.Insert(0, $"[{DateTime.Now:HH:mm:ss}] {msg}"));
+            dispatcher.Invoke(() => LogListBox.Items.Insert(0, $"[{DateTime.Now:HH:mm:ss}] [TCP错误] {ex.Message}"));
         }
         finally
         {
             try { client.Close(); } catch { }
-            lock (_servicesLock)
-            {
-                _activeServices.Remove(service);
-            }
+            e.OnDisconnected?.Invoke();
+            if (service != null) lock (_servicesLock) _activeServices.Remove(service);
             dispatcher.Invoke(() => {
                 _isTcpConnected = false;
-                ShowNotification("TCP已断开", $"手机 {client.DeviceAddress} 已断开连接");
                 UpdateTrayIcon();
                 LogListBox.Items.Insert(0, $"[{DateTime.Now:HH:mm:ss}] TCP客户端已断开");
                 TcpConnectedDeviceName.Visibility = Visibility.Collapsed;
+                HideProgressPanel();
+                // P3-5: 从已连接客户端列表移除
+                lock (_clientsLock) _connectedClients.Remove(connectedClient);
+                RefreshConnectedClientsUI();
             });
         }
     }
 
+    /// <summary>
+    /// P1-8: 防抖刷新文件列表，避免每条日志都触发 RefreshFileList
+    /// </summary>
     private void Service_LogReceived(object? sender, string log)
     {
-        Dispatcher?.Invoke(() => {
+        Dispatcher?.BeginInvoke(() => {
             LogListBox.Items.Insert(0, $"[{DateTime.Now:HH:mm:ss}] {log}");
-            RefreshFileList();
+            if (LogListBox.Items.Count > 500) LogListBox.Items.RemoveAt(LogListBox.Items.Count - 1);
+
+            // 仅当日志内容包含文件操作关键字时才刷新
+            if (log.Contains("已发送文件") || log.Contains("已接收文件") || log.Contains("已删除") ||
+                log.Contains("已创建文件夹") || log.Contains("进入目录") || log.Contains("返回上级"))
+            {
+                ScheduleRefreshFileList();
+            }
         });
+    }
+
+    /// <summary>
+    /// P1-5: 进度条 UI 更新（防抖 200ms）
+    /// </summary>
+    private void Service_ProgressChanged(object? sender, TransferProgress progress)
+    {
+        Dispatcher?.BeginInvoke(() =>
+        {
+            ProgressPanel.Visibility = Visibility.Visible;
+            ProgressFileName.Text = progress.FileName;
+            var percent = progress.Percent;
+            TransferProgressBar.Value = percent;
+            ProgressPercent.Text = $"{percent:0.#}%";
+        });
+    }
+
+    private void HideProgressPanel()
+    {
+        ProgressPanel.Visibility = Visibility.Collapsed;
+        TransferProgressBar.Value = 0;
+        ProgressPercent.Text = "0%";
+    }
+
+    /// <summary>
+    /// P1-8: 防抖 500ms 后刷新文件列表
+    /// </summary>
+    private void ScheduleRefreshFileList()
+    {
+        _refreshDebounceTimer?.Stop();
+        _refreshDebounceTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
+        _refreshDebounceTimer.Tick += (s, e) =>
+        {
+            _refreshDebounceTimer.Stop();
+            RefreshFileListAsync();
+        };
+        _refreshDebounceTimer.Start();
     }
 
     private void BrowseUploadPath_Click(object sender, RoutedEventArgs e)
     {
-        var dialog = new Microsoft.Win32.OpenFolderDialog
-        {
-            InitialDirectory = UploadPathTextBox.Text
-        };
+        var dialog = new Microsoft.Win32.OpenFolderDialog { InitialDirectory = UploadPathTextBox.Text };
         if (dialog.ShowDialog() == true)
         {
             UploadPathTextBox.Text = dialog.FolderName;
+            // P1-6: 持久化
+            _appConfig.UploadPath = dialog.FolderName;
+            _appConfig.Save();
         }
     }
 
     private void Browse_Click(object sender, RoutedEventArgs e)
     {
-        var dialog = new Microsoft.Win32.OpenFolderDialog
-        {
-            InitialDirectory = SharePathTextBox.Text
-        };
+        var dialog = new Microsoft.Win32.OpenFolderDialog { InitialDirectory = SharePathTextBox.Text };
         if (dialog.ShowDialog() == true)
         {
             SharePathTextBox.Text = dialog.FolderName;
-            RefreshFileList();
+            // P1-6: 持久化
+            _appConfig.SharePath = dialog.FolderName;
+            _appConfig.Save();
+            RefreshFileListAsync();
             NotifyAllClientsPathChanged();
         }
     }
 
     private async void NotifyAllClientsPathChanged()
     {
-        List<object> servicesToNotify;
-        lock (_servicesLock)
-        {
-            servicesToNotify = new List<object>(_activeServices);
-        }
+        List<FileTransferServiceBase> servicesToNotify;
+        lock (_servicesLock) servicesToNotify = new List<FileTransferServiceBase>(_activeServices);
 
         foreach (var service in servicesToNotify)
         {
-            try
-            {
-                if (service is BluetoothFileServer.Bluetooth.FileTransferService bluetoothService)
-                {
-                    await bluetoothService.NotifyPathChangedAsync();
-                }
-                else if (service is BluetoothFileServer.Tcp.TcpFileTransferService tcpService)
-                {
-                    await tcpService.NotifyPathChangedAsync();
-                }
-            }
-            catch (Exception ex)
-            {
-                LogToFile($"[NotifyPathChanged] 通知客户端失败: {ex.Message}");
-            }
+            try { await service.NotifyPathChangedAsync(); }
+            catch (Exception ex) { LogToFile($"[NotifyPathChanged] 通知客户端失败: {ex.Message}"); }
         }
     }
 
@@ -668,16 +689,37 @@ public partial class MainWindow : Window
         }
     }
 
-    private void RefreshFileList()
+    /// <summary>
+    /// P1-9: 异步刷新文件列表，避免阻塞 UI 线程
+    /// </summary>
+    private async void RefreshFileListAsync()
     {
-        FileListBox.Items.Clear();
-        if (Directory.Exists(SharePathTextBox.Text))
+        var path = Dispatcher.Invoke(() => SharePathTextBox.Text);
+        if (!Directory.Exists(path)) return;
+
+        try
         {
-            foreach (var file in Directory.GetFiles(SharePathTextBox.Text))
+            var items = await System.Threading.Tasks.Task.Run(() =>
             {
-                var fi = new FileInfo(file);
-                FileListBox.Items.Add($"{fi.Name} ({FormatSize(fi.Length)})");
-            }
+                var result = new List<string>();
+                foreach (var file in Directory.EnumerateFiles(path))
+                {
+                    try
+                    {
+                        var fi = new FileInfo(file);
+                        result.Add($"{fi.Name} ({FormatSize(fi.Length)})");
+                    }
+                    catch { }
+                }
+                return result;
+            });
+
+            FileListBox.Items.Clear();
+            foreach (var item in items) FileListBox.Items.Add(item);
+        }
+        catch (Exception ex)
+        {
+            LogToFile($"[RefreshFileList] {ex.Message}");
         }
     }
 
@@ -695,16 +737,114 @@ public partial class MainWindow : Window
         if (AutoStartCheckBox.IsChecked == true)
         {
             AutoStartHelper.EnableAutoStart();
+            _appConfig.AutoStartWithWindows = true;
         }
         else
         {
             AutoStartHelper.DisableAutoStart();
+            _appConfig.AutoStartWithWindows = false;
+        }
+        _appConfig.Save();
+    }
+
+    /// <summary>
+    /// P3-5: 打开设置窗口
+    /// </summary>
+    private void Settings_Click(object sender, RoutedEventArgs e)
+    {
+        var dialog = new SettingsWindow(
+            _appConfig,
+            SharePathTextBox.Text,
+            UploadPathTextBox.Text)
+        {
+            Owner = this
+        };
+        if (dialog.ShowDialog() == true && dialog.SettingsChanged)
+        {
+            // 最大连接数变更需要重启 TCP 服务才生效
+            var newMax = _appConfig.MaxConnections;
+            if (_tcpServer != null && _isTcpRunning)
+            {
+                var result = MessageBox.Show(
+                    $"最大连接数已更新为 {newMax}，需要重启 TCP 服务才能生效。是否立即重启？",
+                    "重启 TCP 服务",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Question);
+                if (result == MessageBoxResult.Yes)
+                {
+                    int port = 9000;
+                    Dispatcher.Invoke(() => int.TryParse(TcpPortTextBox.Text, out port));
+                    _tcpServer?.StopServer();
+                    _tcpServer?.Dispose();
+                    // 重新创建 TcpServer 以应用新的连接数限制
+                    _tcpServer = new TcpServer(newMax);
+                    _tcpServer.ConnectionStatusChanged += (_, msg) => Dispatcher.Invoke(() => {
+                        TcpStatus.Text = msg;
+                        TcpStatusIndicator.Fill = msg.Contains("已连接") || msg.Contains("运行中")
+                            ? (SolidColorBrush)FindResource("SuccessBrush")
+                            : (SolidColorBrush)FindResource("AccentCyanBrush");
+                        ConnectionStatusText.Text = msg.Contains("已连接") || msg.Contains("运行中") ? "已连接" : "未连接";
+                        StatusIndicator.Fill = msg.Contains("已连接") || msg.Contains("运行中")
+                            ? (SolidColorBrush)FindResource("SuccessBrush")
+                            : (SolidColorBrush)FindResource("TextMutedBrush");
+                        _isTcpRunning = msg.Contains("运行中");
+                        UpdateTrayIcon();
+                    });
+                    _tcpServer.ClientConnected += OnTcpClientConnected;
+                    _tcpServer.StartServer(port);
+                    LogListBox.Items.Insert(0, $"[{DateTime.Now:HH:mm:ss}] TCP 服务已重启 (最大连接数: {newMax})");
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// P3-5: 刷新已连接客户端列表 UI
+    /// </summary>
+    private void RefreshConnectedClientsUI()
+    {
+        List<ConnectedClient> snapshot;
+        lock (_clientsLock) snapshot = new List<ConnectedClient>(_connectedClients);
+        ConnectedClientsList.Items.Clear();
+        foreach (var c in snapshot) ConnectedClientsList.Items.Add(c);
+        ConnectedClientsCount.Text = snapshot.Count.ToString();
+    }
+
+    private void RefreshClients_Click(object sender, RoutedEventArgs e)
+    {
+        RefreshConnectedClientsUI();
+    }
+
+    /// <summary>
+    /// P3-5: 主动断开指定客户端连接
+    /// </summary>
+    private void DisconnectClient_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button btn && btn.Tag is ConnectedClient cc)
+        {
+            var result = MessageBox.Show(
+                $"确定要断开客户端 {cc.DeviceName} ({cc.DeviceAddress}) 的连接吗？",
+                "断开连接",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Question);
+            if (result != MessageBoxResult.Yes) return;
+
+            try
+            {
+                cc.Service?.CloseClient();
+                LogListBox.Items.Insert(0, $"[{DateTime.Now:HH:mm:ss}] 已主动断开: {cc.DisplayText}");
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"[DisconnectClient] {ex.Message}");
+            }
         }
     }
 
     protected override void OnClosed(EventArgs e)
     {
         LogToFile("[MainWindow] Application closing...");
+        AsyncLogger.Shutdown();
         _trayIcon?.Dispose();
         _bluetoothServer?.Dispose();
         _tcpServer?.Dispose();
@@ -718,7 +858,7 @@ public partial class MainWindow : Window
         {
             var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff");
             var logLine = $"[{timestamp}] {message}{Environment.NewLine}";
-            File.AppendAllText(LogFilePath, logLine);
+            AsyncLogger.Append(LogFilePath, logLine);
             System.Diagnostics.Debug.WriteLine(logLine);
         }
         catch { }

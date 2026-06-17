@@ -27,6 +27,8 @@ object FileTransferProtocol {
     const val CMD_CREATE_FOLDER_REQUEST: Byte = 0x0B  // Create folder
     const val CMD_SHARE_PATH_CHANGED: Byte = 0x0C  // Share path changed notification
     const val CMD_UPLOAD_CHUNK: Byte = 0x0D  // Upload chunk (for streaming mode)
+    const val CMD_HEARTBEAT: Byte = 0x0E  // P1-11: 心跳命令（显式处理）
+    const val CMD_FILE_HASH: Byte = 0x0F  // P3-4: 请求文件 SHA-256 哈希
     const val CMD_SUCCESS: Byte = -2  // 0xFE as signed byte
     const val CMD_ERROR: Byte = -1    // 0xFF as signed byte
 
@@ -270,6 +272,8 @@ class FileTransferService(private val client: TransferClient) {
     }
 
     // Download file directly to Downloads using MediaStore API (Android 10+ compatible)
+    // P0-7: offset > 0 时复用已存在文件名，使断点续传真正生效
+    // P1-4: 断点续传状态持久化到 SharedPreferences
     suspend fun downloadFileToFile(
         context: Context,
         fileName: String,
@@ -277,9 +281,17 @@ class FileTransferService(private val client: TransferClient) {
         onProgress: ((Long) -> Unit)? = null
     ): Result<DownloadResult> = withContext(Dispatchers.IO) {
         try {
-            // Always generate unique filename to avoid overwriting existing files
-            // Format: xxx_时间(小时分钟秒).扩展名
-            val actualFileName = generateUniqueFileName(fileName)
+            val resumeStore = ResumeStateStore(context)
+
+            // P0-7: offset > 0 表示断点续传，复用已记录的文件名
+            val actualFileName = if (offset > 0) {
+                // 查找之前下载的文件名
+                resumeStore.getDownloadFileName(fileName) ?: generateUniqueFileName(fileName)
+            } else {
+                val newName = generateUniqueFileName(fileName)
+                resumeStore.saveDownloadFileName(fileName, newName)
+                newName
+            }
 
             // 向PC请求文件时使用原始文件名（PC上文件的实际名字）
             val fileNameBytes = fileName.toByteArray(Charsets.UTF_8)
@@ -290,20 +302,27 @@ class FileTransferService(private val client: TransferClient) {
 
             // Use MediaStore API for Android 10+ compatibility
             val resolver = context.contentResolver
-            val contentValues = android.content.ContentValues().apply {
-                put(android.provider.MediaStore.Downloads.DISPLAY_NAME, actualFileName)
-                put(android.provider.MediaStore.Downloads.MIME_TYPE, "application/octet-stream")
-                put(android.provider.MediaStore.Downloads.IS_PENDING, 1)
-                // 设置相对路径确保文件在Downloads目录
-                put(android.provider.MediaStore.Downloads.RELATIVE_PATH, "Download/")
-            }
 
-            val uri = resolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
-                ?: return@withContext Result.failure(Exception("无法创建文件"))
+            // P0-7: 断点续传时尝试复用已有文件 URI
+            val existingUri = if (offset > 0) resumeStore.getDownloadFileUri(fileName) else null
+            val uri = if (existingUri != null) {
+                // 验证文件仍存在
+                try {
+                    resolver.openFileDescriptor(existingUri, "wa")?.use { }
+                    existingUri
+                } catch (e: Exception) {
+                    // 文件不存在，创建新文件
+                    createNewDownloadFile(resolver, actualFileName)
+                }
+            } else {
+                createNewDownloadFile(resolver, actualFileName)
+            } ?: return@withContext Result.failure(Exception("无法创建文件"))
 
-            resolver.openOutputStream(uri)?.use { outputStream ->
+            resumeStore.saveDownloadFileUri(fileName, uri)
+
+            resolver.openOutputStream(uri, "wa")?.use { outputStream ->
                 var totalReceived = offset
-                val buffer = ByteArray(131072) // 增大到128KB缓冲区
+                val buffer = ByteArray(131072) // 128KB 缓冲区
 
                 while (true) {
                     val response = client.readPacket() ?: return@withContext Result.failure(Exception("连接断开"))
@@ -311,8 +330,8 @@ class FileTransferService(private val client: TransferClient) {
 
                     if (command == FileTransferProtocol.CMD_ERROR) {
                         val data = response.copyOfRange(5, response.size)
-                        // Delete the pending file on error
                         resolver.delete(uri, null, null)
+                        resumeStore.clearDownloadState(fileName)
                         return@withContext Result.failure(Exception(String(data, Charsets.UTF_8)))
                     }
 
@@ -322,30 +341,32 @@ class FileTransferService(private val client: TransferClient) {
 
                     if (command != FileTransferProtocol.CMD_DOWNLOAD_RESPONSE) {
                         resolver.delete(uri, null, null)
+                        resumeStore.clearDownloadState(fileName)
                         return@withContext Result.failure(Exception("服务器响应错误"))
                     }
 
                     val data = response.copyOfRange(5, response.size)
                     if (data.isEmpty()) break
 
-
-                    // Write directly to output stream
                     outputStream.write(data)
                     totalReceived += data.size
 
-                    // Report progress callback
+                    // P1-4: 持久化已下载字节数
+                    resumeStore.saveDownloadOffset(fileName, totalReceived)
+
                     onProgress?.invoke(totalReceived)
                 }
 
                 outputStream.flush()
 
-                // Mark as complete
                 val updateValues = android.content.ContentValues().apply {
                     put(android.provider.MediaStore.Downloads.IS_PENDING, 0)
                 }
                 resolver.update(uri, updateValues, null, null)
 
-                // Return both bytes downloaded AND the actual filename used
+                // P1-4: 下载完成，清除断点续传状态
+                resumeStore.clearDownloadState(fileName)
+
                 Result.success(DownloadResult(totalReceived, actualFileName))
             } ?: run {
                 resolver.delete(uri, null, null)
@@ -354,6 +375,19 @@ class FileTransferService(private val client: TransferClient) {
         } catch (e: Exception) {
             Result.failure(e)
         }
+    }
+
+    private fun createNewDownloadFile(
+        resolver: android.content.ContentResolver,
+        fileName: String
+    ): android.net.Uri? {
+        val contentValues = android.content.ContentValues().apply {
+            put(android.provider.MediaStore.Downloads.DISPLAY_NAME, fileName)
+            put(android.provider.MediaStore.Downloads.MIME_TYPE, "application/octet-stream")
+            put(android.provider.MediaStore.Downloads.IS_PENDING, 1)
+            put(android.provider.MediaStore.Downloads.RELATIVE_PATH, "Download/")
+        }
+        return resolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
     }
 
     // Download with resume support - offset is the bytes already downloaded
@@ -525,9 +559,8 @@ class FileTransferService(private val client: TransferClient) {
                         return@withContext Result.failure(Exception("发送数据失败"))
                     }
                     totalSent += bytesRead
-                    if (chunkCount % 10 == 0) {
-                        onProgress?.invoke(totalSent, fileSize)
-                    }
+                    // P2-9: 每块都更新进度（移除 chunkCount % 10 限制）
+                    onProgress?.invoke(totalSent, fileSize)
                 }
                 android.util.Log.d("FileTransferService", "=== [UPLOAD CHUNKED] all chunks sent, totalChunks=$chunkCount, totalSent=$totalSent")
                 onProgress?.invoke(totalSent, fileSize)
@@ -589,6 +622,118 @@ class FileTransferService(private val client: TransferClient) {
             Result.success(Unit)
         } catch (e: Exception) {
             Result.failure(e)
+        }
+    }
+
+    /**
+     * P3-2: 递归下载文件夹内所有文件
+     *
+     * 导航进入 folderName，下载其中所有文件，并递归处理子目录，完成后返回上级。
+     * 所有文件保存到 Downloads 目录（使用唯一文件名）。
+     *
+     * @param context Android Context
+     * @param folderName 要下载的文件夹名
+     * @param onProgress 回调：(已下载文件数, 总文件数, 当前文件名)
+     * @return 成功下载的文件数，失败返回 Exception
+     */
+    suspend fun downloadFolder(
+        context: Context,
+        folderName: String,
+        onProgress: ((downloaded: Int, total: Int, currentFile: String) -> Unit)? = null
+    ): Result<Int> = withContext(Dispatchers.IO) {
+        var successCount = 0
+        try {
+            // 导航进入文件夹
+            val navResult = navigateToFolder(folderName)
+            if (!navResult.isSuccess) {
+                return@withContext Result.failure(navResult.exceptionOrNull() ?: Exception("无法进入文件夹: $folderName"))
+            }
+
+            val fileList = navResult.getOrNull()?.items ?: emptyList()
+            val files = fileList.filter { !it.isDirectory && !it.isParentDirectory }
+            val dirs = fileList.filter { it.isDirectory && !it.isParentDirectory }
+            val totalInThisLevel = files.size
+
+            // 下载当前层级的所有文件
+            for ((index, file) in files.withIndex()) {
+                onProgress?.invoke(index, totalInThisLevel, file.name)
+                val dlResult = downloadFileToFile(context, file.name, 0L)
+                if (dlResult.isSuccess) {
+                    successCount++
+                }
+            }
+
+            // 递归下载子目录
+            for (dir in dirs) {
+                onProgress?.invoke(successCount, totalInThisLevel, "${dir.name}/")
+                val subResult = downloadFolder(context, dir.name) { d, t, f ->
+                    onProgress?.invoke(successCount + d, totalInThisLevel + t, "${dir.name}/$f")
+                }
+                if (subResult.isSuccess) {
+                    successCount += subResult.getOrNull() ?: 0
+                }
+            }
+
+            // 返回上级目录
+            goBack()
+            Result.success(successCount)
+        } catch (e: Exception) {
+            // 尝试返回上级以恢复状态
+            try { goBack() } catch (_: Exception) {}
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * P3-4: 请求 PC 端文件的 SHA-256 哈希
+     * @return 哈希十六进制字符串，失败返回 null
+     */
+    suspend fun requestFileHash(fileName: String): String? = withContext(Dispatchers.IO) {
+        try {
+            val fileNameBytes = fileName.toByteArray(Charsets.UTF_8)
+            client.writePacket(FileTransferProtocol.CMD_FILE_HASH, fileNameBytes)
+
+            val response = client.readPacket() ?: return@withContext null
+            val command = response[0]
+            if (command == FileTransferProtocol.CMD_ERROR) {
+                val errorData = response.copyOfRange(5, response.size)
+                Log.e("FileTransferService", "哈希请求失败: ${String(errorData, Charsets.UTF_8)}")
+                return@withContext null
+            }
+            if (command == FileTransferProtocol.CMD_FILE_HASH) {
+                val hashData = response.copyOfRange(5, response.size)
+                return@withContext String(hashData, Charsets.UTF_8)
+            }
+            null
+        } catch (e: Exception) {
+            Log.e("FileTransferService", "哈希请求异常: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * P3-4: 计算本地已下载文件的 SHA-256 哈希
+     * @param context Android Context
+     * @param fileName 下载后的实际文件名（带时间戳）
+     * @return 哈希十六进制字符串，失败返回 null
+     */
+    suspend fun computeLocalFileHash(context: Context, fileName: String): String? = withContext(Dispatchers.IO) {
+        try {
+            val uri = findDownloadedFileUri(context, fileName) ?: return@withContext null
+            val md = java.security.MessageDigest.getInstance("SHA-256")
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                val buffer = ByteArray(65536)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    md.update(buffer, 0, read)
+                }
+            }
+            val hashBytes = md.digest()
+            hashBytes.joinToString("") { "%02x".format(it) }
+        } catch (e: Exception) {
+            Log.e("FileTransferService", "本地哈希计算失败: ${e.message}")
+            null
         }
     }
 

@@ -17,10 +17,16 @@ android {
 
     signingConfigs {
         create("release") {
-            storeFile = file("release.jks")
-            storePassword = "bluelink123"
-            keyAlias = "bluelink"
-            keyPassword = "bluelink123"
+            // P0-8: 从环境变量或 local.properties 读取签名密钥，避免硬编码
+            val storeFilePath = System.getenv("BLUELINK_STORE_FILE") ?: "release.jks"
+            val storePwd = System.getenv("BLUELINK_STORE_PASSWORD") ?: ""
+            val alias = System.getenv("BLUELINK_KEY_ALIAS") ?: "bluelink"
+            val keyPwd = System.getenv("BLUELINK_KEY_PASSWORD") ?: ""
+
+            storeFile = file(storeFilePath)
+            if (storePwd.isNotEmpty()) storePassword = storePwd
+            keyAlias = alias
+            if (keyPwd.isNotEmpty()) keyPassword = keyPwd
         }
     }
 
@@ -38,6 +44,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     compileOptions {

@@ -1,14 +1,14 @@
-# Add project specific ProGuard rules here.
+# BluLink ProGuard Rules
 
-# Keep Kotlin metadata
--keep class kotlin.Metadata { *; }
+# P2-2: Release 构建剥离调试日志（Log.d / Log.v）
+# 保留 Log.e / Log.w / Log.i 用于生产环境错误诊断
+-assumenosideeffects class android.util.Log {
+    public static int d(...);
+    public static int v(...);
+}
 
-# Keep Compose classes
--keep class androidx.compose.** { *; }
+# 保留 BuildConfig
+-keep class com.bluelink.transfer.BuildConfig { *; }
 
-# Keep data classes
--keep class com.bluelink.transfer.** { *; }
-
-# Network classes
--keep class java.net.** { *; }
--keep class java.io.** { *; }
+# Kotlin 元数据
+-keepattributes *Annotation*, InnerClasses, Signature, Exceptions

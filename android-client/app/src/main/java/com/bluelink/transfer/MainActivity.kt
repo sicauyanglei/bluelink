@@ -14,7 +14,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Home
@@ -24,7 +23,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import kotlinx.coroutines.launch
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontFamily
@@ -48,6 +46,10 @@ class MainActivity : ComponentActivity() {
     private var _debugLogs by mutableStateOf<List<String>>(emptyList())
     private var _showDebugLog by mutableStateOf(false)
     private var _resumeCount by mutableIntStateOf(0)
+    // P1-12: 独立的文件列表刷新触发器，避免 selectedTab + connectionStateVersion 值碰撞
+    private var _fileListRefreshTrigger by mutableIntStateOf(0)
+    // P2-7: 主题模式（持久化）
+    private var _themeMode by mutableStateOf(ThemeMode.SYSTEM)
     val bluetoothClient get() = _bluetoothClient
     val tcpClient get() = _tcpClient
     val transferService get() = _transferService
@@ -56,10 +58,26 @@ class MainActivity : ComponentActivity() {
     val resumeTrigger get() = _resumeTrigger
     val resumeCount get() = _resumeCount
     val connectionStateVersion get() = _connectionStateVersion
+    val fileListRefreshTrigger get() = _fileListRefreshTrigger
     val tcpHost get() = _tcpHost
     val tcpPort get() = _tcpPort
     val debugLogs get() = _debugLogs
     val showDebugLog get() = _showDebugLog
+    val themeMode get() = _themeMode
+
+    fun toggleTheme() {
+        _themeMode = when (_themeMode) {
+            ThemeMode.SYSTEM -> ThemeMode.LIGHT
+            ThemeMode.LIGHT -> ThemeMode.DARK
+            ThemeMode.DARK -> ThemeMode.SYSTEM
+        }
+        getSharedPreferences("bluelink_prefs", MODE_PRIVATE)
+            .edit().putInt("theme_mode", _themeMode.ordinal).apply()
+    }
+
+    fun triggerFileListRefresh() {
+        _fileListRefreshTrigger++
+    }
 
     fun addDebugLog(msg: String) {
         val timestamp = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())
@@ -72,13 +90,14 @@ class MainActivity : ComponentActivity() {
 
     fun clearDebugLog() {
         _debugLogs = emptyList()
-        // Delete all bluelink_debug_log* files from Downloads
+        // P0: 修复误删用户 log 开头文件，仅精确删除应用自身日志文件
         lifecycleScope.launch {
             try {
                 val resolver = contentResolver
                 val projection = arrayOf(android.provider.MediaStore.Downloads._ID)
+                // 仅删除 bluelink_debug_log 前缀的文件，避免误删用户文件
                 val selection = "${android.provider.MediaStore.Downloads.DISPLAY_NAME} LIKE ? AND ${android.provider.MediaStore.Downloads.RELATIVE_PATH} = ?"
-                val selectionArgs = arrayOf("log%", "Download/")
+                val selectionArgs = arrayOf("bluelink_debug_log%", "Download/")
                 var deletedCount = 0
                 contentResolver.query(
                     android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI,
@@ -218,12 +237,13 @@ class MainActivity : ComponentActivity() {
 
         if (btDisconnected && tcpDisconnected) {
             if (btClient?.isReconnecting != true && tcpCli?.isReconnecting != true) {
+                // P1-3: 用 lifecycleScope 替代 GlobalScope
                 if (btClient?.hasConnectionInfo == true) {
                     addDebugLog(">>> onResume: 触发蓝牙后台重连")
-                    kotlinx.coroutines.GlobalScope.launch { btClient.autoReconnect() }
+                    lifecycleScope.launch { btClient.autoReconnect() }
                 } else if (tcpCli?.hasConnectionInfo == true) {
                     addDebugLog(">>> onResume: 触发TCP后台重连")
-                    kotlinx.coroutines.GlobalScope.launch { tcpCli.autoReconnect() }
+                    lifecycleScope.launch { tcpCli.autoReconnect() }
                 }
             }
         }
@@ -231,6 +251,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // P2-7: 加载持久化的主题模式
+        _themeMode = ThemeMode.fromOrdinalSafe(
+            getSharedPreferences("bluelink_prefs", MODE_PRIVATE).getInt("theme_mode", 0)
+        )
 
         addDebugLog(">>> MainActivity onCreate 开始")
         
@@ -256,7 +281,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             MaterialTheme(
-                colorScheme = lightColorScheme
+                colorScheme = bluLinkColorScheme(_themeMode)
             ) {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
@@ -270,10 +295,12 @@ class MainActivity : ComponentActivity() {
                         pathChangedTrigger = _pathChangedTrigger,
                         resumeCount = _resumeCount,
                         connectionStateVersion = _connectionStateVersion,
+                        fileListRefreshTrigger = _fileListRefreshTrigger,
                         tcpHost = _tcpHost,
                         tcpPort = _tcpPort,
                         debugLogs = _debugLogs,
                         showDebugLog = _showDebugLog,
+                        themeMode = _themeMode,
                         onBluetoothConnected = { client, service ->
                             _bluetoothClient = client
                             _tcpClient = null
@@ -328,39 +355,15 @@ class MainActivity : ComponentActivity() {
                         onToggleDebugLog = { _showDebugLog = !_showDebugLog },
                         onClearDebugLog = { clearDebugLog() },
                         onAddDebugLog = { msg -> addDebugLog(msg) },
-                        onTriggerPathRefresh = { triggerPathRefresh() }
+                        onTriggerPathRefresh = { triggerPathRefresh() },
+                        onTriggerFileListRefresh = { triggerFileListRefresh() },
+                        onToggleTheme = { toggleTheme() }
                     )
                 }
             }
         }
     }
 }
-
-private val lightColorScheme = lightColorScheme(
-    primary = Color(0xFF1976D2),
-    onPrimary = Color.White,
-    primaryContainer = Color(0xFFBBDEFB),
-    onPrimaryContainer = Color(0xFF0D47A1),
-    secondary = Color(0xFF26A69A),
-    onSecondary = Color.White,
-    secondaryContainer = Color(0xFFB2DFDB),
-    onSecondaryContainer = Color(0xFF00695C),
-    tertiary = Color(0xFF7C4DFF),
-    onTertiary = Color.White,
-    tertiaryContainer = Color(0xFFE8DAFF),
-    onTertiaryContainer = Color(0xFF4A148C),
-    error = Color(0xFFF44336),
-    onError = Color.White,
-    errorContainer = Color(0xFFFFCDD2),
-    onErrorContainer = Color(0xFFB71C1C),
-    background = Color(0xFFF5F7FA),
-    onBackground = Color(0xFF1C1B1F),
-    surface = Color.White,
-    onSurface = Color(0xFF1C1B1F),
-    surfaceVariant = Color(0xFFE8EDF2),
-    onSurfaceVariant = Color(0xFF49454F),
-    outline = Color(0xFF79747E)
-)
 
 @SuppressLint("MissingPermission")
 @OptIn(ExperimentalMaterial3Api::class)
@@ -373,10 +376,12 @@ fun MainScreen(
     pathChangedTrigger: Int = 0,
     resumeCount: Int = 0,
     connectionStateVersion: Int = 0,
+    fileListRefreshTrigger: Int = 0,
     tcpHost: String,
     tcpPort: String,
     debugLogs: List<String> = emptyList(),
     showDebugLog: Boolean = false,
+    themeMode: ThemeMode = ThemeMode.SYSTEM,
     onBluetoothConnected: (BluetoothClient, FileTransferService) -> Unit,
     onTcpConnected: (TcpClient, FileTransferService) -> Unit,
     onDisconnect: () -> Unit,
@@ -387,7 +392,9 @@ fun MainScreen(
     onToggleDebugLog: () -> Unit = {},
     onClearDebugLog: () -> Unit = {},
     onAddDebugLog: (String) -> Unit = {},
-    onTriggerPathRefresh: () -> Unit = {}
+    onTriggerPathRefresh: () -> Unit = {},
+    onTriggerFileListRefresh: () -> Unit = {},
+    onToggleTheme: () -> Unit = {}
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     var selectedTab by remember { mutableStateOf(0) }
@@ -482,6 +489,14 @@ fun MainScreen(
                             )
                         }
                         Spacer(modifier = Modifier.width(8.dp))
+                        // P2-7: 主题切换按钮
+                        TextButton(
+                            onClick = onToggleTheme,
+                            colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.onPrimary)
+                        ) {
+                            Text(themeMode.label, style = MaterialTheme.typography.labelSmall)
+                        }
+                        Spacer(modifier = Modifier.width(4.dp))
                         // Debug button
                         TextButton(
                             onClick = onToggleDebugLog,
@@ -645,13 +660,14 @@ fun MainScreen(
                         FileListScreen(
                             client = client,
                             transferService = transferService,
-                            triggerRefresh = selectedTab + connectionStateVersion,
+                            triggerRefresh = fileListRefreshTrigger,
                             pathChangedTrigger = pathChangedTrigger,
                             resumeCount = resumeCount,
                             connectionType = connectionType,
                             onConnectionLost = {
                                 onReconnecting()
                             },
+                            onRefreshRequested = { onTriggerFileListRefresh() }
                         )
                     }
                 } else if (hasClient) {

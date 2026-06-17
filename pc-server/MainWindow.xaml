@@ -15,6 +15,7 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
@@ -62,7 +63,14 @@
                                Text="未连接"
                                FontSize="12"
                                Foreground="{StaticResource TextSecondaryBrush}"
-                               VerticalAlignment="Center"/>
+                               VerticalAlignment="Center"
+                               Margin="0,0,12,0"/>
+                    <Button x:Name="SettingsButton"
+                            Content="⚙ 设置"
+                            Style="{StaticResource SecondaryButtonStyle}"
+                            Width="80" Height="32"
+                            FontSize="12"
+                            Click="Settings_Click"/>
                 </StackPanel>
             </Grid>
         </Border>
@@ -231,10 +239,70 @@
             </Grid>
         </GroupBox>
 
-        <!-- Shared Directory Section -->
-        <GroupBox Grid.Row="3" Header="共享目录">
+        <!-- Connected Clients Section (P3-5) -->
+        <GroupBox Grid.Row="3" Header="已连接客户端">
             <Grid>
                 <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,8">
+                    <TextBlock Text="当前连接数: "
+                               Foreground="{StaticResource TextSecondaryBrush}"
+                               VerticalAlignment="Center"/>
+                    <TextBlock x:Name="ConnectedClientsCount"
+                               Text="0"
+                               Foreground="{StaticResource PrimaryBrush}"
+                               FontWeight="SemiBold"
+                               VerticalAlignment="Center"
+                               Margin="4,0,12,0"/>
+                    <Button x:Name="RefreshClientsButton"
+                            Content="刷新"
+                            Style="{StaticResource SecondaryButtonStyle}"
+                            Width="60" Height="28"
+                            FontSize="11"
+                            Padding="8,2"
+                            Click="RefreshClients_Click"/>
+                </StackPanel>
+
+                <ListBox x:Name="ConnectedClientsList"
+                         Grid.Row="1"
+                         MaxHeight="120"
+                         Style="{StaticResource ModernListBoxStyle}">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <Grid Margin="2">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0"
+                                           Text="{Binding DisplayText}"
+                                           Foreground="{StaticResource TextPrimaryBrush}"
+                                           FontSize="12"
+                                           VerticalAlignment="Center"/>
+                                <Button Grid.Column="1"
+                                        Content="断开"
+                                        Style="{StaticResource SecondaryButtonStyle}"
+                                        Width="50" Height="24"
+                                        FontSize="11"
+                                        Padding="6,2"
+                                        Margin="8,0,0,0"
+                                        Tag="{Binding}"
+                                        Click="DisconnectClient_Click"/>
+                            </Grid>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+            </Grid>
+        </GroupBox>
+
+        <!-- Shared Directory Section -->
+        <GroupBox Grid.Row="4" Header="共享目录">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="*"/>
@@ -259,7 +327,6 @@
                                FontSize="11" Margin="0,0,0,4"/>
                     <TextBox x:Name="SharePathTextBox"
                              Grid.Row="1" Grid.Column="0"
-                             Text="E:\"
                              FontSize="13"
                              Padding="8,6"
                              VerticalContentAlignment="Center"/>
@@ -275,7 +342,6 @@
                                FontSize="11" Margin="0,0,0,4"/>
                     <TextBox x:Name="UploadPathTextBox"
                              Grid.Row="1" Grid.Column="3"
-                             Text="E:\upload"
                              FontSize="13"
                              Padding="8,6"
                              VerticalContentAlignment="Center"/>
@@ -287,9 +353,48 @@
                             Click="BrowseUploadPath_Click"/>
                 </Grid>
 
-                <!-- File List -->
+                <!-- P1-5: Transfer Progress Bar -->
+                <Border Grid.Row="1"
+                        Background="{StaticResource SurfaceVariantBrush}"
+                        CornerRadius="6"
+                        Padding="12,6"
+                        Margin="0,0,0,8"
+                        Visibility="Collapsed"
+                        x:Name="ProgressPanel">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0">
+                            <TextBlock x:Name="ProgressFileName"
+                                       FontSize="11"
+                                       Foreground="{StaticResource TextSecondaryBrush}"
+                                       TextTrimming="CharacterEllipsis"/>
+                            <ProgressBar x:Name="TransferProgressBar"
+                                         Height="8"
+                                         Minimum="0" Maximum="100"
+                                         Margin="0,4,0,0"
+                                         Value="0"/>
+                        </StackPanel>
+                        <TextBlock x:Name="ProgressPercent"
+                                   Grid.Column="1"
+                                   FontSize="11"
+                                   FontWeight="SemiBold"
+                                   Foreground="{StaticResource PrimaryBrush}"
+                                   VerticalAlignment="Center"
+                                   Margin="8,0,0,0"
+                                   Text="0%"/>
+                    </Grid>
+                </Border>
+
+                <!-- File List (P1-9: VirtualizingStackPanel) -->
                 <ListBox x:Name="FileListBox"
-                         Grid.Row="2"
+                         Grid.Row="3"
+                         VirtualizingPanel.IsVirtualizing="True"
+                         VirtualizingPanel.VirtualizationMode="Recycling"
+                         ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                         ScrollViewer.VerticalScrollBarVisibility="Auto"
                          Style="{StaticResource ModernListBoxStyle}">
                     <ListBox.ItemTemplate>
                         <DataTemplate>
@@ -309,7 +414,7 @@
         </GroupBox>
 
         <!-- Transfer Log Section -->
-        <GroupBox Grid.Row="4" Height="100">
+        <GroupBox Grid.Row="5" Height="100">
             <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>

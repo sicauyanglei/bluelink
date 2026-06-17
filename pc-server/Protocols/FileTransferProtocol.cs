@@ -1,3 +1,5 @@
+using System.Buffers.Binary;
+
 namespace BluetoothFileServer.Protocols;
 
 public static class FileTransferProtocol
@@ -11,11 +13,13 @@ public static class FileTransferProtocol
     public const byte CMD_UPLOAD_RESPONSE = 0x06;   // Upload response
     public const byte CMD_DELETE_REQUEST = 0x07;    // Delete request
     public const byte CMD_TRANSFER_COMPLETE = 0x08; // Transfer complete signal
-    public const byte CMD_NAVIGATE_REQUEST = 0x09; // Navigate to subdirectory: folder name length(4 bytes) + folder name
-    public const byte CMD_BACK_REQUEST = 0x0A;     // Go back to parent directory
-    public const byte CMD_CREATE_FOLDER_REQUEST = 0x0B; // Create folder: folder name length(4 bytes) + folder name
+    public const byte CMD_NAVIGATE_REQUEST = 0x09;  // Navigate to subdirectory
+    public const byte CMD_BACK_REQUEST = 0x0A;      // Go back to parent directory
+    public const byte CMD_CREATE_FOLDER_REQUEST = 0x0B; // Create folder
     public const byte CMD_SHARE_PATH_CHANGED = 0x0C; // Share path changed notification (PC -> Android)
     public const byte CMD_UPLOAD_CHUNK = 0x0D;       // Upload chunk (streaming mode data)
+    public const byte CMD_HEARTBEAT = 0x0E;          // P1-11: 心跳命令（显式处理）
+    public const byte CMD_FILE_HASH = 0x0F;          // P3-4: 请求文件 SHA-256 哈希
     public const byte CMD_SUCCESS = 0xFE;           // Success
     public const byte CMD_ERROR = 0xFF;             // Error
 
@@ -28,28 +32,45 @@ public static class FileTransferProtocol
         var packet = new byte[HEADER_SIZE + data.Length];
         packet[0] = command;
         // Use big-endian (network byte order) for length
-        packet[1] = (byte)(data.Length >> 24);
-        packet[2] = (byte)(data.Length >> 16);
-        packet[3] = (byte)(data.Length >> 8);
-        packet[4] = (byte)data.Length;
+        WriteInt32BigEndian(packet, 1, data.Length);
         data.CopyTo(packet, HEADER_SIZE);
+        return packet;
+    }
+
+    /// <summary>
+    /// P2-1: 零拷贝重载，避免每次 Array.Copy 创建新数组
+    /// </summary>
+    public static byte[] CreatePacket(byte command, byte[] buffer, int length)
+    {
+        var packet = new byte[HEADER_SIZE + length];
+        packet[0] = command;
+        WriteInt32BigEndian(packet, 1, length);
+        System.Array.Copy(buffer, 0, packet, HEADER_SIZE, length);
         return packet;
     }
 
     public static (byte command, byte[] data) ParsePacket(byte[] packet)
     {
+        if (packet == null || packet.Length < HEADER_SIZE)
+            throw new ArgumentException("packet too short");
+
         var command = packet[0];
         var length = ReadInt32BigEndian(packet, 1);
+
+        // 防御：长度越界
+        if (length < 0 || length > packet.Length - HEADER_SIZE)
+            throw new ArgumentException($"invalid length {length}");
+
         var data = new byte[length];
         Array.Copy(packet, HEADER_SIZE, data, 0, length);
         return (command, data);
     }
 
-    // Big-endian read helpers (for matching Android/Java standard)
+    // 修复：用 uint 解析避免最高位为 1 时变负数（长度 > 2GB）
     public static int ReadInt32BigEndian(byte[] buffer, int offset)
     {
-        return (buffer[offset] << 24) | (buffer[offset + 1] << 16) |
-               (buffer[offset + 2] << 8) | buffer[offset + 3];
+        return (int)((uint)buffer[offset] << 24 | (uint)buffer[offset + 1] << 16 |
+                     (uint)buffer[offset + 2] << 8 | buffer[offset + 3]);
     }
 
     public static long ReadInt64BigEndian(byte[] buffer, int offset)
@@ -78,5 +99,25 @@ public static class FileTransferProtocol
         buffer[offset + 5] = (byte)(value >> 16);
         buffer[offset + 6] = (byte)(value >> 8);
         buffer[offset + 7] = (byte)value;
+    }
+
+    /// <summary>
+    /// P1-10: CRC16-CCITT 校验（用于数据完整性）
+    /// </summary>
+    public static ushort ComputeCrc16(byte[] data, int offset, int length)
+    {
+        ushort crc = 0xFFFF;
+        for (int i = 0; i < length; i++)
+        {
+            crc ^= (ushort)(data[offset + i] << 8);
+            for (int j = 0; j < 8; j++)
+            {
+                if ((crc & 0x8000) != 0)
+                    crc = (ushort)((crc << 1) ^ 0x1021);
+                else
+                    crc = (ushort)(crc << 1);
+            }
+        }
+        return crc;
     }
 }

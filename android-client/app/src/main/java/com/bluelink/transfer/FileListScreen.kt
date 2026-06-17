@@ -228,7 +228,8 @@ fun FileListScreen(
     pathChangedTrigger: Int = 0,
     resumeCount: Int = 0,
     connectionType: String? = null,  // "蓝牙" or "TCP"
-    onConnectionLost: (() -> Unit)? = null
+    onConnectionLost: (() -> Unit)? = null,
+    onRefreshRequested: () -> Unit = {}
 ) {
     var files by remember { mutableStateOf<List<FileItem>>(emptyList()) }
     var currentPath by remember { mutableStateOf("") }
@@ -244,6 +245,11 @@ fun FileListScreen(
     var uploadFileName by remember { mutableStateOf("") }
     var uploadProgress by remember { mutableStateOf(0f) }
     var uploadSpeed by remember { mutableStateOf("") }
+    // P2-8: 传输历史对话框
+    var showHistoryDialog by remember { mutableStateOf(false) }
+    // P3-2: 文件夹递归下载状态
+    var downloadingFolderName by remember { mutableStateOf<String?>(null) }
+    var folderDownloadStatus by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
 
@@ -551,6 +557,18 @@ fun FileListScreen(
                         )
                     }
                 }
+                // P2-8: 传输历史按钮
+                IconButton(
+                    onClick = { showHistoryDialog = true },
+                    modifier = Modifier.size(36.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.History,
+                        contentDescription = "传输历史",
+                        modifier = Modifier.size(20.dp),
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
                 // Connection type badge
                 if (connectionType != null) {
                     Surface(
@@ -754,23 +772,7 @@ fun FileListScreen(
 
                 // Refresh button - 48dp touch target
                 IconButton(
-                    onClick = {
-                        isRefreshing = true
-                        scope.launch {
-                            if (transferService != null) {
-                                val result = transferService.getFileList()
-                                if (result.isSuccess) {
-                                    val fileListResult = result.getOrNull()
-                                    files = fileListResult?.items ?: emptyList()
-                                    currentPath = fileListResult?.currentPath ?: ""
-                                    statusMessage = "刷新成功 (${files.size} 个项目)"
-                                } else {
-                                    statusMessage = "刷新失败: ${result.exceptionOrNull()?.message}"
-                                }
-                            }
-                            isRefreshing = false
-                        }
-                    },
+                    onClick = { onRefreshRequested() },
                     enabled = !isRefreshing && transferService != null,
                     modifier = Modifier.size(44.dp)
                 ) {
@@ -970,11 +972,20 @@ fun FileListScreen(
                                 scope.launch {
                                     val selectedList = selectedFiles.toList()
                                     selectedFiles = emptySet()
+                                    // P3-3: 启动前台服务（批量下载）
+                                    TransferForegroundService.startTransfer(context, "批量下载", "($batchTotalFiles 个文件)")
                                     for (fileName in selectedList) {
                                         batchDownloadCurrent = fileName
                                         val file = files.find { it.name == fileName }
                                         if (file != null && !file.isDirectory) {
                                             statusMessage = "正在下载 ($batchCompletedFiles/$batchTotalFiles): $fileName"
+                                            // P3-3: 更新通知栏进度
+                                            TransferForegroundService.updateProgress(
+                                                context,
+                                                batchCompletedFiles,
+                                                batchTotalFiles,
+                                                fileName
+                                            )
                                             val dlKey = "$currentPath/$fileName"
                                             val localProgress = downloadProgress[dlKey] ?: 0L
                                             // 使用流式下载直接写入文件
@@ -997,6 +1008,8 @@ fun FileListScreen(
                                     }
                                     isDownloadingBatch = false
                                     statusMessage = "批量下载完成 ($batchCompletedFiles/$batchTotalFiles)"
+                                    // P3-3: 通知栏完成
+                                    TransferForegroundService.complete(context, "批量下载完成: $batchCompletedFiles/$batchTotalFiles")
                                 }
                             },
                             colors = ButtonDefaults.buttonColors(
@@ -1360,6 +1373,56 @@ fun FileListScreen(
                                 }
                             }
                         },
+                        onDownloadFolder = if (!isMultiSelectMode && transferService != null && !item.isParentDirectory) {
+                            {
+                                if (downloadingFolderName == null) {
+                                    scope.launch {
+                                        downloadingFolderName = item.name
+                                        folderDownloadStatus = "正在下载文件夹: ${item.name}"
+                                        statusMessage = folderDownloadStatus
+                                        // P3-3: 启动前台服务（文件夹下载）
+                                        TransferForegroundService.startTransfer(context, "下载文件夹", item.name)
+                                        val startTime = System.currentTimeMillis()
+                                        val result = transferService?.downloadFolder(
+                                            context = context,
+                                            folderName = item.name,
+                                            onProgress = { downloaded, total, currentFile ->
+                                                folderDownloadStatus = "下载中 ($downloaded/$total): $currentFile"
+                                                statusMessage = folderDownloadStatus
+                                                // P3-3: 更新通知栏进度
+                                                TransferForegroundService.updateProgress(
+                                                    context,
+                                                    downloaded,
+                                                    total,
+                                                    currentFile
+                                                )
+                                            }
+                                        )
+                                        val elapsedMs = System.currentTimeMillis() - startTime
+                                        downloadingFolderName = null
+                                        if (result?.isSuccess == true) {
+                                            val count = result.getOrNull() ?: 0
+                                            statusMessage = "文件夹下载完成: ${item.name} ($count 个文件)"
+                                            // P3-3: 通知栏完成
+                                            TransferForegroundService.complete(context, "文件夹下载完成: ${item.name} ($count 个文件)")
+                                            // P2-8: 记录历史
+                                            TransferHistory.record(
+                                                context,
+                                                TransferHistory.Direction.DOWNLOAD,
+                                                "📁${item.name}/",
+                                                0L,
+                                                success = true,
+                                                durationMs = elapsedMs
+                                            )
+                                        } else {
+                                            statusMessage = "文件夹下载失败: ${result?.exceptionOrNull()?.message}"
+                                            TransferForegroundService.complete(context, "文件夹下载失败: ${item.name}")
+                                        }
+                                    }
+                                }
+                            }
+                        } else null,
+                        isDownloadingFolder = downloadingFolderName == item.name,
                         onClick = {
                             if (isMultiSelectMode) {
                                 // Toggle selection in multi-select mode
@@ -1438,6 +1501,8 @@ fun FileListScreen(
                                     lastDownloadUpdateTime = System.currentTimeMillis()
                                     lastDownloadUpdateBytes = localProgress
                                     statusMessage = "正在下载: ${file.name}"
+                                    // P3-3: 启动前台服务，通知栏显示进度
+                                    TransferForegroundService.startTransfer(context, "下载", file.name)
                                     if (transferService != null) {
                                         val fileSize = file.size
                                         val startTime = System.currentTimeMillis()
@@ -1455,6 +1520,16 @@ fun FileListScreen(
                                                     if (fileSize > 0) {
                                                         val progress = (received.toFloat() / fileSize).coerceAtMost(1f)
                                                         downloadingProgress = progress
+                                                        // P3-3: 更新通知栏进度（节流到 500ms）
+                                                        val now = System.currentTimeMillis()
+                                                        if (now - lastDownloadUpdateTime >= 500) {
+                                                            TransferForegroundService.updateProgress(
+                                                                context,
+                                                                (progress * 100).toInt(),
+                                                                100,
+                                                                file.name
+                                                            )
+                                                        }
 
                                                         // Calculate real-time speed
                                                         val currentTime = System.currentTimeMillis()
@@ -1489,6 +1564,20 @@ fun FileListScreen(
                                             downloadProgress = downloadProgress + (dlKey to (localProgress + totalBytes))
                                             lastDownloadedFile = downloadResult?.actualFileName ?: file.name
                                             statusMessage = "下载完成: ${downloadResult?.actualFileName ?: file.name}"
+                                            // P3-3: 通知栏完成
+                                            TransferForegroundService.complete(
+                                                context,
+                                                "下载完成: ${downloadResult?.actualFileName ?: file.name}"
+                                            )
+                                            // P2-8: 记录传输历史
+                                            TransferHistory.record(
+                                                context,
+                                                TransferHistory.Direction.DOWNLOAD,
+                                                downloadResult?.actualFileName ?: file.name,
+                                                totalBytes,
+                                                success = true,
+                                                durationMs = elapsedMs
+                                            )
                                             // Default to delete APK after install
                                             val downloadedFileName = downloadResult?.actualFileName ?: file.name
                                             val isApkFile = downloadedFileName.lowercase().endsWith(".apk")
@@ -1506,9 +1595,34 @@ fun FileListScreen(
                                                     prefs.edit().putString("quick_dirs", quickDirs.joinToString(",")).apply()
                                                 }
                                             }
+                                            // P3-4: 后台哈希校验（不阻塞 UI）
+                                            if (totalBytes > 0 && localProgress == 0L) {
+                                                scope.launch {
+                                                    val serverHash = transferService?.requestFileHash(file.name)
+                                                    val localHash = transferService?.computeLocalFileHash(context, downloadedFileName)
+                                                    if (serverHash != null && localHash != null) {
+                                                        if (serverHash == localHash) {
+                                                            statusMessage = "✓ 哈希校验通过: ${downloadedFileName}"
+                                                        } else {
+                                                            statusMessage = "✗ 哈希校验失败! 文件可能损坏: ${downloadedFileName}"
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         } else {
                                             val errorMsg = result.exceptionOrNull()?.message ?: ""
                                             statusMessage = "下载失败: $errorMsg"
+                                            // P3-3: 失败时停止前台服务
+                                            TransferForegroundService.complete(context, "下载失败: ${file.name}")
+                                            // P2-8: 记录失败的传输
+                                            TransferHistory.record(
+                                                context,
+                                                TransferHistory.Direction.DOWNLOAD,
+                                                file.name,
+                                                file.size,
+                                                success = false,
+                                                durationMs = System.currentTimeMillis() - startTime
+                                            )
                                             // Check if it's a connection error
                                             if (errorMsg.contains("连接") || errorMsg.contains("Connection") ||
                                                 errorMsg.contains("timeout") || errorMsg.contains("断开")) {
@@ -1629,9 +1743,93 @@ fun FileListScreen(
         )
     }
 
-}
+    // P2-8: 传输历史对话框
+    if (showHistoryDialog) {
+        val records = remember(showHistoryDialog) { TransferHistory.getAll(context) }
+        val stats = remember(showHistoryDialog) { TransferHistory.getStats(context) }
+        val dateFormat = remember { java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault()) }
 
-// Upload screen composable
+        AlertDialog(
+            onDismissRequest = { showHistoryDialog = false },
+            title = { Text("传输历史") },
+            text = {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    // 统计摘要
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f)
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text("下载: ${stats.totalDownloads} 个 / ${formatSize(stats.totalDownloadBytes)}", style = MaterialTheme.typography.bodySmall)
+                                Text("上传: ${stats.totalUploads} 个 / ${formatSize(stats.totalUploadBytes)}", style = MaterialTheme.typography.bodySmall)
+                            }
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text("成功率: ${"%.1f".format(stats.successRate * 100)}%", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                                Text("均速: ${formatSpeed(stats.avgSpeedBps)}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                            }
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    if (records.isEmpty()) {
+                        Text("暂无传输记录", modifier = Modifier.padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    } else {
+                        LazyColumn(modifier = Modifier.heightIn(max = 300.dp)) {
+                            items(records) { record ->
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = if (record.direction == TransferHistory.Direction.DOWNLOAD) Icons.Default.Download else Icons.Default.Upload,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp),
+                                        tint = if (record.success) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(record.fileName, style = MaterialTheme.typography.bodySmall, maxLines = 1, fontWeight = FontWeight.Medium)
+                                        Text(
+                                            "${dateFormat.format(java.util.Date(record.timestamp))} • ${formatSize(record.sizeBytes)}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                    Icon(
+                                        imageVector = if (record.success) Icons.Default.CheckCircle else Icons.Default.Error,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp),
+                                        tint = if (record.success) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Row {
+                    if (records.isNotEmpty()) {
+                        TextButton(onClick = {
+                            TransferHistory.clear(context)
+                            showHistoryDialog = false
+                        }) {
+                            Text("清空", color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                    TextButton(onClick = { showHistoryDialog = false }) {
+                        Text("关闭")
+                    }
+                }
+            }
+        )
+    }
+
+}
 @Composable
 fun UploadScreen(
     transferService: FileTransferService?,
@@ -1934,7 +2132,9 @@ fun UploadScreen(
                                 
                                 scope.launch {
                                     var successCount = 0
-                                    
+
+                                    // P3-3: 启动前台服务（多文件上传）
+                                    TransferForegroundService.startTransfer(context, "批量上传", "($totalFilesToUpload 个文件)")
                                     for (index in selectedFileUris.indices) {
                                         currentUploadIndex = index
                                         val uri = selectedFileUris[index]
@@ -1944,7 +2144,14 @@ fun UploadScreen(
                                         uploadProgress = 0f
                                         uploadSpeed = ""
                                         statusMessage = "正在上传 ($index/$totalFilesToUpload): $safeFileName"
-                                        
+                                        // P3-3: 更新通知栏进度
+                                        TransferForegroundService.updateProgress(
+                                            context,
+                                            index,
+                                            totalFilesToUpload,
+                                            safeFileName
+                                        )
+
                                         try {
                                             val result = transferService.uploadFileChunked(
                                                 context = context,
@@ -1958,13 +2165,27 @@ fun UploadScreen(
                                             )
                                             if (result.isSuccess) {
                                                 successCount++
+                                                // P2-8: 记录上传历史
+                                                val fileSize = try {
+                                                    context.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: 0L
+                                                } catch (_: Exception) { 0L }
+                                                TransferHistory.record(
+                                                    context,
+                                                    TransferHistory.Direction.UPLOAD,
+                                                    safeFileName,
+                                                    fileSize,
+                                                    success = true,
+                                                    durationMs = 0L
+                                                )
                                             }
                                         } catch (e: Exception) {
                                             // Continue with next file even if one fails
                                         }
                                     }
-                                    
+
                                     statusMessage = "上传完成: $successCount/$totalFilesToUpload 个文件"
+                                    // P3-3: 通知栏完成
+                                    TransferForegroundService.complete(context, "批量上传完成: $successCount/$totalFilesToUpload")
                                     isUploading = false
                                     showUploadDialog = false
                                     selectedFileUris = emptyList()
@@ -1972,7 +2193,7 @@ fun UploadScreen(
                                     totalFilesToUpload = 0
                                     uploadProgress = 0f
                                     uploadSpeed = ""
-                                    
+
                                     // Refresh file list if any files were uploaded
                                     if (successCount > 0) {
                                         transferService.getFileList()
@@ -1984,6 +2205,8 @@ fun UploadScreen(
                                 if (uri != null) {
                                     isUploading = true
                                     statusMessage = "正在上传: $uploadFileName"
+                                    // P3-3: 启动前台服务（上传）
+                                    TransferForegroundService.startTransfer(context, "上传", uploadFileName)
                                     scope.launch {
                                         try {
                                             val result = transferService.uploadFileChunked(
@@ -1993,17 +2216,52 @@ fun UploadScreen(
                                                 onProgress = { sent, total ->
                                                     if (total > 0) {
                                                         uploadProgress = sent.toFloat() / total.toFloat()
+                                                        // P3-3: 更新通知栏进度（节流到 500ms）
+                                                        val now = System.currentTimeMillis()
+                                                        if (now - lastDownloadUpdateTime >= 500) {
+                                                            TransferForegroundService.updateProgress(
+                                                                context,
+                                                                (uploadProgress * 100).toInt(),
+                                                                100,
+                                                                uploadFileName
+                                                            )
+                                                            lastDownloadUpdateTime = now
+                                                        }
                                                     }
                                                 }
                                             )
                                             if (result.isSuccess) {
                                                 statusMessage = "上传完成: $uploadFileName"
+                                                // P3-3: 通知栏完成
+                                                TransferForegroundService.complete(context, "上传完成: $uploadFileName")
+                                                // P2-8: 记录上传历史
+                                                val fileSize = try {
+                                                    context.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: 0L
+                                                } catch (_: Exception) { 0L }
+                                                TransferHistory.record(
+                                                    context,
+                                                    TransferHistory.Direction.UPLOAD,
+                                                    uploadFileName,
+                                                    fileSize,
+                                                    success = true,
+                                                    durationMs = 0L
+                                                )
                                                 val listResult = transferService.getFileList()
                                             } else {
                                                 statusMessage = "上传失败: ${result.exceptionOrNull()?.message}"
+                                                TransferForegroundService.complete(context, "上传失败: $uploadFileName")
+                                                TransferHistory.record(
+                                                    context,
+                                                    TransferHistory.Direction.UPLOAD,
+                                                    uploadFileName,
+                                                    0L,
+                                                    success = false,
+                                                    durationMs = 0L
+                                                )
                                             }
                                         } catch (e: Exception) {
                                             statusMessage = "上传失败: ${e.message}"
+                                            TransferForegroundService.complete(context, "上传失败: $uploadFileName")
                                         }
                                         isUploading = false
                                         showUploadDialog = false
@@ -2045,6 +2303,8 @@ fun DirectoryItemCard(
     isMultiSelectMode: Boolean = false,
     isSelected: Boolean = false,
     onSelectToggle: (() -> Unit)? = null,
+    onDownloadFolder: (() -> Unit)? = null,
+    isDownloadingFolder: Boolean = false,
     onClick: () -> Unit
 ) {
     Card(
@@ -2055,6 +2315,7 @@ fun DirectoryItemCard(
         colors = CardDefaults.cardColors(
             containerColor = when {
                 isSelected -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f)
+                isDownloadingFolder -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f)
                 else -> MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.3f)
             }
         ),
@@ -2119,6 +2380,32 @@ fun DirectoryItemCard(
                     tint = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
                 )
             } else {
+                // P3-2: 下载文件夹按钮（非父目录时显示）
+                if (!item.isParentDirectory && onDownloadFolder != null) {
+                    FilledTonalIconButton(
+                        onClick = onDownloadFolder,
+                        enabled = !isDownloadingFolder,
+                        modifier = Modifier.size(40.dp),
+                        colors = IconButtonDefaults.filledTonalIconButtonColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f)
+                        )
+                    ) {
+                        if (isDownloadingFolder) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(20.dp),
+                                strokeWidth = 2.dp
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Default.Download,
+                                contentDescription = "下载文件夹",
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.width(4.dp))
+                }
                 Icon(
                     imageVector = Icons.Default.ChevronRight,
                     contentDescription = "进入",

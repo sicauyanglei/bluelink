@@ -9,6 +9,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.os.Build
 import android.widget.Toast
 import androidx.compose.animation.*
 import androidx.compose.foundation.BorderStroke
@@ -96,7 +97,13 @@ fun DeviceScanScreen(
             override fun onReceive(ctx: Context?, intent: Intent?) {
                 when (intent?.action) {
                     BluetoothDevice.ACTION_FOUND -> {
-                        val device = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+                        // P0-10: 修复废弃 API，API 33+ 用新签名
+                        val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                        }
                         device?.let {
                             if (!devices.contains(it)) {
                                 devices = devices + it
@@ -109,9 +116,14 @@ fun DeviceScanScreen(
     }
 
     // Register receiver
+    // P0-9: Android 14+ 必须指定 RECEIVER_NOT_EXPORTED
     DisposableEffect(Unit) {
         val filter = IntentFilter(BluetoothDevice.ACTION_FOUND)
-        context.registerReceiver(receiver, filter)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            context.registerReceiver(receiver, filter)
+        }
         onDispose {
             try {
                 context.unregisterReceiver(receiver)
