@@ -275,6 +275,9 @@ fun FileListScreen(
     // Delete APK after install option (persisted)
     var deleteAfterInstall by remember { mutableStateOf(false) }
 
+    // Downloaded files cache - persisted list of downloaded files with their actual saved names
+    var downloadedFiles by remember { mutableStateOf<Map<String, String>>(emptyMap()) }  // key: original filePath, value: actual saved fileName
+
     // Pending delete file after install completes (when user returns from install screen)
     var pendingDeleteFile by remember { mutableStateOf<String?>(null) }
 
@@ -286,6 +289,20 @@ fun FileListScreen(
             quickDirs = savedDirs.split(",").filter { it.isNotEmpty() }
         }
         deleteAfterInstall = prefs.getBoolean("delete_after_install", false)
+        
+        // Load downloaded files cache
+        val savedDownloadedFiles = prefs.getString("downloaded_files", "") ?: ""
+        if (savedDownloadedFiles.isNotEmpty()) {
+            val entries = savedDownloadedFiles.split(";;")
+            val map = mutableMapOf<String, String>()
+            for (entry in entries) {
+                val parts = entry.split("::")
+                if (parts.size == 2) {
+                    map[parts[0]] = parts[1]
+                }
+            }
+            downloadedFiles = map
+        }
     }
 
     // File picker for upload
@@ -1393,8 +1410,26 @@ fun FileListScreen(
                     val dlKey = "$currentPath/${file.name}"
                     val localProgress = downloadProgress[dlKey] ?: 0L
                     val isDownloading = downloadingFileName == file.name
-                    // File is complete if: (1) size > 0 and fully downloaded, OR (2) size = 0 but was downloaded successfully
-                    val isComplete = if (file.size > 0) {
+                    // Check if file is in downloaded files cache (persisted)
+                    val isInDownloadedCache = downloadedFiles.containsKey(dlKey)
+                    // File is complete if: 
+                    // (1) size > 0 and fully downloaded, OR 
+                    // (2) size = 0 but was downloaded successfully, OR
+                    // (3) file is in persisted downloaded files cache
+                    val isComplete = if (isInDownloadedCache) {
+                        // Check if file still exists locally
+                        val actualFileName = downloadedFiles[dlKey]
+                        if (actualFileName != null) {
+                            val fileUri = if (actualFileName.lowercase().endsWith(".apk")) {
+                                findApkFileUri(context, actualFileName)
+                            } else {
+                                findDownloadedFileUri(context, actualFileName)
+                            }
+                            fileUri != null
+                        } else {
+                            false
+                        }
+                    } else if (file.size > 0) {
                         localProgress >= file.size
                     } else {
                         // Compare base names (ignoring timestamp suffix like _120131)
@@ -1497,13 +1532,20 @@ fun FileListScreen(
                                                 val prefs = context.getSharedPreferences("file_transfer_prefs", android.content.Context.MODE_PRIVATE)
                                                 prefs.edit().putBoolean("delete_after_install", true).apply()
                                             }
+                                            
+                                            // Save download record (persisted)
+                                            downloadedFiles = downloadedFiles + (dlKey to downloadedFileName)
+                                            val prefs2 = context.getSharedPreferences("file_transfer_prefs", android.content.Context.MODE_PRIVATE)
+                                            val downloadedFilesStr = downloadedFiles.entries.joinToString(";;") { "${it.key}::${it.value}" }
+                                            prefs2.edit().putString("downloaded_files", downloadedFilesStr).apply()
+                                            
                                             // Record quick directory (only if downloading a file, not resuming)
                                             if (localProgress == 0L && currentPath.isNotEmpty()) {
                                                 if (currentPath !in quickDirs) {
                                                     quickDirs = (listOf(currentPath) + quickDirs).take(5)
                                                     // Persist quick directories
-                                                    val prefs = context.getSharedPreferences("file_transfer_prefs", android.content.Context.MODE_PRIVATE)
-                                                    prefs.edit().putString("quick_dirs", quickDirs.joinToString(",")).apply()
+                                                    val prefs3 = context.getSharedPreferences("file_transfer_prefs", android.content.Context.MODE_PRIVATE)
+                                                    prefs3.edit().putString("quick_dirs", quickDirs.joinToString(",")).apply()
                                                 }
                                             }
                                         } else {
@@ -1527,6 +1569,13 @@ fun FileListScreen(
                             {
                                 fileToDelete = file.name
                                 showDeleteDialog = true
+                            }
+                        } else null,
+                        actualFileName = downloadedFiles[dlKey],
+                        onInstall = if (isComplete && file.name.lowercase().endsWith(".apk")) {
+                            {
+                                val fileName = downloadedFiles[dlKey] ?: file.name
+                                installApk(context, fileName)
                             }
                         } else null
                     )
@@ -2141,7 +2190,9 @@ fun FileItemCard(
     isSelected: Boolean = false,
     onSelectToggle: (() -> Unit)? = null,
     onDownload: () -> Unit,
-    onDelete: (() -> Unit)? = null
+    onDelete: (() -> Unit)? = null,
+    actualFileName: String? = null,
+    onInstall: (() -> Unit)? = null
 ) {
     FileItemCardContent(
         file = file,
@@ -2154,7 +2205,9 @@ fun FileItemCard(
         isSelected = isSelected,
         onSelectToggle = onSelectToggle,
         onDownload = onDownload,
-        onDelete = onDelete
+        onDelete = onDelete,
+        actualFileName = actualFileName,
+        onInstall = onInstall
     )
 }
 
@@ -2170,7 +2223,9 @@ private fun FileItemCardContent(
     isSelected: Boolean = false,
     onSelectToggle: (() -> Unit)? = null,
     onDownload: () -> Unit,
-    onDelete: (() -> Unit)? = null
+    onDelete: (() -> Unit)? = null,
+    actualFileName: String? = null,
+    onInstall: (() -> Unit)? = null
 ) {
     Card(
         modifier = Modifier
@@ -2336,12 +2391,41 @@ private fun FileItemCardContent(
                         )
                     }
                 } else if (isComplete) {
-                    Icon(
-                        imageVector = Icons.Default.CheckCircle,
-                        contentDescription = "已下载",
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(22.dp)
-                    )
+                    // Show install icon for APK files, otherwise show checkmark
+                    val isApk = actualFileName?.lowercase()?.endsWith(".apk") == true || 
+                               file.name.lowercase().endsWith(".apk")
+                    if (isApk && onInstall != null) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.CheckCircle,
+                                contentDescription = "已下载",
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(22.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            FilledTonalIconButton(
+                                onClick = onInstall,
+                                modifier = Modifier.size(40.dp),
+                                colors = IconButtonDefaults.filledTonalIconButtonColors(
+                                    containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f)
+                                )
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Android,
+                                    contentDescription = "安装",
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                        }
+                    } else {
+                        Icon(
+                            imageVector = Icons.Default.CheckCircle,
+                            contentDescription = "已下载",
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
                 } else {
                     FilledTonalIconButton(
                         onClick = onDownload,

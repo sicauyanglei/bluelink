@@ -24,8 +24,6 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
         private const val HEARTBEAT_INTERVAL_MS = 30000L
         private const val HEARTBEAT_TIMEOUT_MS = 10000L
         private const val BACKGROUND_RECONNECT_INTERVAL_MS = 5000L
-        // Cap payload size to prevent OOM from corrupted/malicious length fields.
-        private const val MAX_PACKET_PAYLOAD_SIZE = 16 * 1024 * 1024 // 16 MB
     }
 
     private var socket: BluetoothSocket? = null
@@ -49,31 +47,8 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
 
     override val hasConnectionInfo: Boolean get() = lastConnectedDevice != null
 
-    private fun setSocketTimeout(socket: BluetoothSocket?, timeoutMs: Int) {
-        try {
-            val fileDescriptor = socket?.javaClass?.getField("mSocketHandle")?.let {
-                it.isAccessible = true
-                val fdField = socket.javaClass.getDeclaredField("mSocketHandle")
-                fdField.isAccessible = true
-                val fdObject = inputStream?.javaClass?.getDeclaredField("mFd")
-                fdObject?.isAccessible = true
-                fdObject?.get(inputStream) as? java.io.FileDescriptor
-            }
-            if (fileDescriptor != null) {
-                fileDescriptor.sync()
-                val method = socket?.javaClass?.getMethod("setSocketTimeout", Int::class.java)
-                method?.invoke(socket, timeoutMs)
-            }
-        } catch (e: Exception) {
-            Log.d(TAG, "Could not set socket timeout via mSocketHandle: ${e.message}")
-            try {
-                val method = socket?.javaClass?.getMethod("setSocketTimeout", Int::class.java)
-                method?.invoke(socket, timeoutMs)
-            } catch (e2: Exception) {
-                Log.d(TAG, "Could not set socket timeout: ${e2.message}")
-            }
-        }
-    }
+    // 协程作用域 - 关联到特定的连接
+    private val coroutineScope = MainScope()
 
     suspend fun connect(device: BluetoothDevice): Result<Unit> = withContext(Dispatchers.IO) {
         try {
@@ -88,15 +63,13 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
             socket = createSocket.invoke(device, SERVICE_UUID) as BluetoothSocket
 
             socket?.connect()
-            setSocketTimeout(socket, CONNECT_TIMEOUT_MS)
             inputStream = socket?.inputStream
             outputStream = socket?.outputStream
-            setSocketTimeout(socket, READ_TIMEOUT_MS)
 
             lastConnectedDevice = device
             isManuallyDisconnected = false
 
-            Log.d(TAG, "connected successfully with ${CONNECT_TIMEOUT_MS}ms timeout")
+            Log.d(TAG, "connected successfully")
             startHeartBeat()
             Result.success(Unit)
         } catch (e: IOException) {
@@ -138,10 +111,8 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
                 socket = createSocket.invoke(device, SERVICE_UUID) as BluetoothSocket
 
                 socket?.connect()
-                setSocketTimeout(socket, CONNECT_TIMEOUT_MS)
                 inputStream = socket?.inputStream
                 outputStream = socket?.outputStream
-                setSocketTimeout(socket, READ_TIMEOUT_MS)
 
                 Log.d(TAG, "autoReconnect: success on attempt $attempt")
                 _isReconnecting = false
@@ -170,7 +141,7 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
         if (isManuallyDisconnected || lastConnectedDevice == null) return
 
         Log.d(TAG, "startBackgroundReconnect: starting periodic reconnect")
-        backgroundReconnectJob = kotlinx.coroutines.GlobalScope.launch {
+        backgroundReconnectJob = coroutineScope.launch {
             while (!isManuallyDisconnected && !isConnected) {
                 delay(BACKGROUND_RECONNECT_INTERVAL_MS)
                 if (isManuallyDisconnected || isConnected) break
@@ -194,10 +165,8 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
                         )
                         socket = createSocket.invoke(device, SERVICE_UUID) as BluetoothSocket
                         socket?.connect()
-                        setSocketTimeout(socket, CONNECT_TIMEOUT_MS)
                         inputStream = socket?.inputStream
                         outputStream = socket?.outputStream
-                        setSocketTimeout(socket, READ_TIMEOUT_MS)
                     }
 
                     Log.d(TAG, "backgroundReconnect: success!")
@@ -222,6 +191,8 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
         isManuallyDisconnected = true
         stopHeartBeat()
         stopBackgroundReconnect()
+        // 取消所有协程
+        coroutineScope.cancel()
         _isReconnecting = false
         try {
             inputStream?.close()
@@ -239,7 +210,7 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
 
     private fun startHeartBeat() {
         stopHeartBeat()
-        heartBeatJob = kotlinx.coroutines.GlobalScope.launch {
+        heartBeatJob = coroutineScope.launch {
             while (isConnected && !isManuallyDisconnected) {
                 try {
                     delay(HEARTBEAT_INTERVAL_MS)
@@ -249,7 +220,7 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
                     Log.e(TAG, "heartbeat error: ${e.message}")
                     if (!isManuallyDisconnected) {
                         Log.d(TAG, "heartbeat failed, triggering reconnection...")
-                        kotlinx.coroutines.GlobalScope.launch {
+                        launch {
                             autoReconnect()
                         }
                     }
@@ -267,18 +238,15 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
     override suspend fun readPacket(): ByteArray? = withContext(Dispatchers.IO) {
         try {
             val header = ByteArray(5)
-            // Loop to read the full 5-byte header. A single read() may return
-            // fewer bytes than requested on stream-based I/O; that is normal and
-            // must NOT be treated as a fatal error (it caused spurious disconnects).
-            var headerOffset = 0
-            while (headerOffset < 5) {
-                val read = inputStream?.read(header, headerOffset, 5 - headerOffset) ?: -1
-                if (read <= 0) {
-                    Log.w(TAG, "readPacket: header EOF (read=$read), connection may be closed")
-                    handleReadError()
-                    return@withContext null
-                }
-                headerOffset += read
+            Log.d(TAG, "[${System.currentTimeMillis()%100000}] readPacket: waiting for header...")
+            val headerRead = inputStream?.read(header) ?: run {
+                handleReadError()
+                return@withContext null
+            }
+            Log.d(TAG, "[${System.currentTimeMillis()%100000}] readPacket: headerRead=$headerRead")
+            if (headerRead != 5) {
+                handleReadError()
+                return@withContext null
             }
 
             val length = ((header[1].toInt() and 0xFF) shl 24) or
@@ -286,20 +254,13 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
                         ((header[3].toInt() and 0xFF) shl 8) or
                         (header[4].toInt() and 0xFF)
 
-            Log.d(TAG, "readPacket: cmd=${header[0]}, len=$length")
-
-            // Validate payload length to prevent OOM from corrupted/malicious data.
-            if (length < 0 || length > MAX_PACKET_PAYLOAD_SIZE) {
-                Log.e(TAG, "readPacket: invalid payload length $length (max $MAX_PACKET_PAYLOAD_SIZE)")
-                handleReadError()
-                return@withContext null
-            }
-            if (length == 0) return@withContext header
+            Log.d(TAG, "[${System.currentTimeMillis()%100000}] readPacket: cmd=${header[0]}, len=$length")
+            if (length <= 0) return@withContext header
 
             val data = ByteArray(length)
             var offset = 0
             while (offset < length) {
-                val read = inputStream?.read(data, offset, length - offset) ?: -1
+                val read = inputStream?.read(data, offset, length - offset) ?: 0
                 if (read <= 0) {
                     Log.w(TAG, "read returned $read, connection may be closed")
                     handleReadError()
@@ -321,7 +282,7 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
     private fun handleReadError() {
         if (!isManuallyDisconnected) {
             Log.d(TAG, "read failed, triggering reconnection...")
-            kotlinx.coroutines.GlobalScope.launch {
+            coroutineScope.launch {
                 autoReconnect()
             }
         }
@@ -390,7 +351,7 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
     private fun handleWriteError() {
         if (!isManuallyDisconnected) {
             Log.d(TAG, "write failed, triggering reconnection...")
-            kotlinx.coroutines.GlobalScope.launch {
+            coroutineScope.launch {
                 autoReconnect()
             }
         }

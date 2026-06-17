@@ -330,17 +330,14 @@ fun ConnectScreen(
 
         // Check if server is reachable
         suspend fun isServerReachable(ip: String): Boolean = withContext(Dispatchers.IO) {
-            // Use try-finally to ensure the socket is closed even if connect() throws.
-            // Previously the socket leaked on any exception path.
-            val socket = java.net.Socket()
             try {
+                val socket = java.net.Socket()
                 socket.soTimeout = 500
                 socket.connect(java.net.InetSocketAddress(ip, 9000))
+                socket.close()
                 true
             } catch (e: Exception) {
                 false
-            } finally {
-                try { socket.close() } catch (_: Exception) { }
             }
         }
 

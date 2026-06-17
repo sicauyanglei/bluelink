@@ -13,8 +13,6 @@ class TcpClient : TransferClient {
         private const val HEARTBEAT_INTERVAL_MS = 30000L
         private const val HEARTBEAT_TIMEOUT_MS = 10000L
         private const val BACKGROUND_RECONNECT_INTERVAL_MS = 5000L
-        // Cap payload size to prevent OOM from corrupted/malicious length fields.
-        private const val MAX_PACKET_PAYLOAD_SIZE = 16 * 1024 * 1024 // 16 MB
     }
 
     private var socket: Socket? = null
@@ -37,6 +35,9 @@ class TcpClient : TransferClient {
     override val isConnected: Boolean get() = socket?.isConnected == true && !_isReconnecting
 
     override val hasConnectionInfo: Boolean get() = lastHost != null && lastPort != null
+
+    // 协程作用域 - 关联到特定的连接
+    private val coroutineScope = MainScope()
 
     suspend fun connect(host: String, port: Int): Result<Unit> = withContext(Dispatchers.IO) {
         try {
@@ -128,7 +129,7 @@ class TcpClient : TransferClient {
         if (isManuallyDisconnected || lastHost == null || lastPort == null) return
 
         Log.d(TAG, "startBackgroundReconnect: starting periodic reconnect")
-        backgroundReconnectJob = kotlinx.coroutines.GlobalScope.launch {
+        backgroundReconnectJob = coroutineScope.launch {
             while (!isManuallyDisconnected && !isConnected) {
                 delay(BACKGROUND_RECONNECT_INTERVAL_MS)
                 if (isManuallyDisconnected || isConnected) break
@@ -182,6 +183,8 @@ class TcpClient : TransferClient {
         isManuallyDisconnected = true
         stopHeartBeat()
         stopBackgroundReconnect()
+        // 取消所有协程
+        coroutineScope.cancel()
         _isReconnecting = false
         try {
             socket?.close()
@@ -195,7 +198,7 @@ class TcpClient : TransferClient {
 
     private fun startHeartBeat() {
         stopHeartBeat()
-        heartBeatJob = kotlinx.coroutines.GlobalScope.launch {
+        heartBeatJob = coroutineScope.launch {
             while (isConnected && !isManuallyDisconnected) {
                 try {
                     delay(HEARTBEAT_INTERVAL_MS)
@@ -205,7 +208,7 @@ class TcpClient : TransferClient {
                     Log.e(TAG, "heartbeat error: ${e.message}")
                     if (!isManuallyDisconnected) {
                         Log.d(TAG, "heartbeat failed, triggering reconnection...")
-                        kotlinx.coroutines.GlobalScope.launch {
+                        launch {
                             autoReconnect()
                         }
                     }
@@ -223,17 +226,13 @@ class TcpClient : TransferClient {
     override suspend fun readPacket(): ByteArray? = withContext(Dispatchers.IO) {
         try {
             val header = ByteArray(5)
-            // Loop to read the full 5-byte header. A single read() may return
-            // fewer bytes than requested on stream-based I/O; that is normal and
-            // must NOT be treated as a fatal error (it caused spurious disconnects).
-            var headerOffset = 0
-            while (headerOffset < 5) {
-                val read = inputStream?.read(header, headerOffset, 5 - headerOffset) ?: -1
-                if (read <= 0) {
-                    handleReadError()
-                    return@withContext null
-                }
-                headerOffset += read
+            val headerRead = inputStream?.read(header) ?: run {
+                handleReadError()
+                return@withContext null
+            }
+            if (headerRead != 5) {
+                handleReadError()
+                return@withContext null
             }
 
             val length = ((header[1].toInt() and 0xFF) shl 24) or
@@ -241,18 +240,12 @@ class TcpClient : TransferClient {
                         ((header[3].toInt() and 0xFF) shl 8) or
                         (header[4].toInt() and 0xFF)
 
-            // Validate payload length to prevent OOM from corrupted/malicious data.
-            if (length < 0 || length > MAX_PACKET_PAYLOAD_SIZE) {
-                Log.e(TAG, "readPacket: invalid payload length $length (max $MAX_PACKET_PAYLOAD_SIZE)")
-                handleReadError()
-                return@withContext null
-            }
-            if (length == 0) return@withContext header
+            if (length <= 0) return@withContext header
 
             val data = ByteArray(length)
             var offset = 0
             while (offset < length) {
-                val read = inputStream?.read(data, offset, length - offset) ?: -1
+                val read = inputStream?.read(data, offset, length - offset) ?: 0
                 if (read <= 0) {
                     handleReadError()
                     return@withContext null
@@ -271,7 +264,7 @@ class TcpClient : TransferClient {
     private fun handleReadError() {
         if (!isManuallyDisconnected) {
             Log.d(TAG, "read failed, triggering reconnection...")
-            kotlinx.coroutines.GlobalScope.launch {
+            coroutineScope.launch {
                 autoReconnect()
             }
         }
@@ -340,7 +333,7 @@ class TcpClient : TransferClient {
     private fun handleWriteError() {
         if (!isManuallyDisconnected) {
             Log.d(TAG, "write failed, triggering reconnection...")
-            kotlinx.coroutines.GlobalScope.launch {
+            coroutineScope.launch {
                 autoReconnect()
             }
         }

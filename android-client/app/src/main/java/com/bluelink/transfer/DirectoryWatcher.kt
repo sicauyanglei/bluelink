@@ -3,7 +3,6 @@ package com.bluelink.transfer
 import android.content.Context
 import android.net.Uri
 import android.os.Handler
-import android.os.HandlerThread
 import android.os.Looper
 import android.provider.MediaStore
 import kotlinx.coroutines.CoroutineScope
@@ -27,7 +26,7 @@ class DirectoryWatcher(
         private const val KEY_WATCH_DIRECTORY = "watch_directory"
         private const val KEY_WATCH_ENABLED = "watch_enabled"
         private const val KEY_LAST_PROCESSED_TIME = "last_processed_time"
-
+        
         // 默认监视目录
         fun getDefaultWatchDirectory(context: Context): File {
             val dcimDir = android.os.Environment.getExternalStoragePublicDirectory(
@@ -43,7 +42,7 @@ class DirectoryWatcher(
         // 获取文件的 Uri (使用 FileProvider)
         fun getFileUri(context: Context, file: File, onLog: (String) -> Unit = {}): Uri {
             onLog("DirectoryWatcher: getFileUri: file=${file.absolutePath}, exists=${file.exists()}")
-
+            
             return try {
                 val uri = androidx.core.content.FileProvider.getUriForFile(
                     context,
@@ -60,11 +59,7 @@ class DirectoryWatcher(
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    // Use a background HandlerThread for scanning instead of the main looper.
-    // Previously the scan runnable ran on the main thread, so listFiles() /
-    // file.exists() / file.length() (blocking file I/O) caused ANRs.
-    private val scanThread = HandlerThread("DirectoryWatcher").apply { start() }
-    private val handler = Handler(scanThread.looper)
+    private val handler = Handler(Looper.getMainLooper())
     private val isWatching = AtomicBoolean(false)
     private val processedFiles = ConcurrentHashMap.newKeySet<String>()
     private val uploadedFiles = ConcurrentHashMap.newKeySet<String>()
@@ -310,16 +305,14 @@ class DirectoryWatcher(
 
     // 处理文件
     private fun processFile(file: File) {
-        // Use add()'s return value to make the check-then-act atomic. Previously
-        // contains() + add() was not atomic, so two concurrent scans could both
-        // pass the check and upload the file twice.
-        if (!processedFiles.add(file.absolutePath)) {
+        if (processedFiles.contains(file.absolutePath)) {
             return
         }
-
+        
+        processedFiles.add(file.absolutePath)
         onLog("DirectoryWatcher: Processing new file: ${file.name}")
         listener?.onFileDetected(file.name)
-
+        
         // 开始上传
         scope.launch {
             uploadFile(file)
@@ -377,7 +370,5 @@ class DirectoryWatcher(
     fun destroy() {
         stopWatching()
         scope.cancel()
-        // Quit the background HandlerThread to release its looper and thread.
-        scanThread.quit()
     }
 }
