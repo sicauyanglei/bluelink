@@ -220,13 +220,28 @@ class MainActivity : ComponentActivity() {
             if (btClient?.isReconnecting != true && tcpCli?.isReconnecting != true) {
                 if (btClient?.hasConnectionInfo == true) {
                     addDebugLog(">>> onResume: 触发蓝牙后台重连")
-                    kotlinx.coroutines.GlobalScope.launch { btClient.autoReconnect() }
+                    // Use lifecycleScope instead of GlobalScope so the coroutine is
+                    // cancelled when the Activity is destroyed and cannot operate on
+                    // a dead context.
+                    lifecycleScope.launch { btClient.autoReconnect() }
                 } else if (tcpCli?.hasConnectionInfo == true) {
                     addDebugLog(">>> onResume: 触发TCP后台重连")
-                    kotlinx.coroutines.GlobalScope.launch { tcpCli.autoReconnect() }
+                    lifecycleScope.launch { tcpCli.autoReconnect() }
                 }
             }
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // Disconnect both clients so their sockets, streams, and background
+        // coroutines (heartbeat, reconnect) are released. Previously onDestroy was
+        // not overridden, so the clients leaked until process death.
+        try { _bluetoothClient?.disconnect() } catch (_: Exception) { }
+        try { _tcpClient?.disconnect() } catch (_: Exception) { }
+        _bluetoothClient = null
+        _tcpClient = null
+        _transferService = null
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {

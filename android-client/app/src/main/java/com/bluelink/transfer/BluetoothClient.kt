@@ -24,6 +24,8 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
         private const val HEARTBEAT_INTERVAL_MS = 30000L
         private const val HEARTBEAT_TIMEOUT_MS = 10000L
         private const val BACKGROUND_RECONNECT_INTERVAL_MS = 5000L
+        // Cap payload size to prevent OOM from corrupted/malicious length fields.
+        private const val MAX_PACKET_PAYLOAD_SIZE = 16 * 1024 * 1024 // 16 MB
     }
 
     private var socket: BluetoothSocket? = null
@@ -265,15 +267,18 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
     override suspend fun readPacket(): ByteArray? = withContext(Dispatchers.IO) {
         try {
             val header = ByteArray(5)
-            Log.d(TAG, "[${System.currentTimeMillis()%100000}] readPacket: waiting for header...")
-            val headerRead = inputStream?.read(header) ?: run {
-                handleReadError()
-                return@withContext null
-            }
-            Log.d(TAG, "[${System.currentTimeMillis()%100000}] readPacket: headerRead=$headerRead")
-            if (headerRead != 5) {
-                handleReadError()
-                return@withContext null
+            // Loop to read the full 5-byte header. A single read() may return
+            // fewer bytes than requested on stream-based I/O; that is normal and
+            // must NOT be treated as a fatal error (it caused spurious disconnects).
+            var headerOffset = 0
+            while (headerOffset < 5) {
+                val read = inputStream?.read(header, headerOffset, 5 - headerOffset) ?: -1
+                if (read <= 0) {
+                    Log.w(TAG, "readPacket: header EOF (read=$read), connection may be closed")
+                    handleReadError()
+                    return@withContext null
+                }
+                headerOffset += read
             }
 
             val length = ((header[1].toInt() and 0xFF) shl 24) or
@@ -281,13 +286,20 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
                         ((header[3].toInt() and 0xFF) shl 8) or
                         (header[4].toInt() and 0xFF)
 
-            Log.d(TAG, "[${System.currentTimeMillis()%100000}] readPacket: cmd=${header[0]}, len=$length")
-            if (length <= 0) return@withContext header
+            Log.d(TAG, "readPacket: cmd=${header[0]}, len=$length")
+
+            // Validate payload length to prevent OOM from corrupted/malicious data.
+            if (length < 0 || length > MAX_PACKET_PAYLOAD_SIZE) {
+                Log.e(TAG, "readPacket: invalid payload length $length (max $MAX_PACKET_PAYLOAD_SIZE)")
+                handleReadError()
+                return@withContext null
+            }
+            if (length == 0) return@withContext header
 
             val data = ByteArray(length)
             var offset = 0
             while (offset < length) {
-                val read = inputStream?.read(data, offset, length - offset) ?: 0
+                val read = inputStream?.read(data, offset, length - offset) ?: -1
                 if (read <= 0) {
                     Log.w(TAG, "read returned $read, connection may be closed")
                     handleReadError()

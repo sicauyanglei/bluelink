@@ -30,6 +30,9 @@ public partial class MainWindow : Window
     private bool _isTcpRunning = false;
     private bool _isBluetoothConnected = false;
     private bool _isTcpConnected = false;
+    private bool _forceExit = false;
+    // Cap the in-memory log list to prevent unbounded growth and O(n) insert cost.
+    private const int MaxLogEntries = 1000;
     private readonly List<object> _activeServices = new();
     private readonly object _servicesLock = new();
     private static readonly string LogFilePath = Path.Combine(
@@ -103,12 +106,20 @@ public partial class MainWindow : Window
         });
         _tcpServer.ClientConnected += OnTcpClientConnected;
 
-        // Initialize Discovery server (auto-start)
-        _discoveryServer = new DiscoveryServer();
+        // Initialize Discovery server (auto-start).
+        // Pass the actual TCP port so discovery responses advertise the correct port.
+        // Previously the port was hardcoded to 9000 inside DiscoveryServer, so if the
+        // user changed the TCP port in the UI, discovery sent clients to the wrong port.
+        int discoveryTcpPort = 9000;
+        if (int.TryParse(TcpPortTextBox.Text, out var parsedPort) && parsedPort > 0 && parsedPort < 65536)
+        {
+            discoveryTcpPort = parsedPort;
+        }
+        _discoveryServer = new DiscoveryServer(discoveryTcpPort);
         _discoveryServer.DiscoveryStatusChanged += (_, msg) => Dispatcher.Invoke(() =>
         {
             System.Diagnostics.Debug.WriteLine($"[Discovery] {msg}");
-            LogListBox.Items.Insert(0, $"[{DateTime.Now:HH:mm:ss}] {msg}");
+            AddLog(msg);
         });
         _discoveryServer.StartDiscovery();
 
@@ -329,11 +340,17 @@ public partial class MainWindow : Window
 
     private void Window_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
     {
-        // Hide to tray instead of closing, unless it's a forced close
-        e.Cancel = true;
-        WindowState = WindowState.Minimized;
-        Hide();
-        _trayIcon.Visibility = Visibility.Visible;
+        // Hide to tray instead of closing, unless it's a forced close.
+        // Previously this unconditionally cancelled, so OnClosed (which disposes the
+        // Bluetooth/TCP/Discovery servers) never ran when exiting via the tray menu,
+        // leaking listeners and sockets until process exit.
+        if (!_forceExit)
+        {
+            e.Cancel = true;
+            WindowState = WindowState.Minimized;
+            Hide();
+            _trayIcon.Visibility = Visibility.Visible;
+        }
     }
 
     private void TrayMenu_ShowWindow(object sender, RoutedEventArgs e)
@@ -387,8 +404,9 @@ public partial class MainWindow : Window
 
     private void TrayMenu_Exit(object sender, RoutedEventArgs e)
     {
-        // Force close - exit the application
-        _trayIcon.Dispose();
+        // Force close - allow Window_Closing to proceed so OnClosed runs and disposes
+        // all servers (Bluetooth/TCP/Discovery) and the tray icon.
+        _forceExit = true;
         Application.Current.Shutdown();
     }
 
@@ -593,10 +611,23 @@ public partial class MainWindow : Window
 
     private void Service_LogReceived(object? sender, string log)
     {
-        Dispatcher?.Invoke(() => {
-            LogListBox.Items.Insert(0, $"[{DateTime.Now:HH:mm:ss}] {log}");
-            RefreshFileList();
-        });
+        // IMPORTANT: do NOT call RefreshFileList() here. The previous implementation
+        // refreshed the file list (synchronous Directory.GetFiles on the UI thread)
+        // on every single log line. During a transfer this ran hundreds of times per
+        // second, freezing the UI. The file list is now refreshed only when the share
+        // path changes or on explicit user action.
+        Dispatcher?.Invoke(() => AddLog(log));
+    }
+
+    // Append a log entry to the list box, capped to MaxLogEntries to prevent
+    // unbounded growth and the O(n) per-insert cost from shifting all items.
+    private void AddLog(string log)
+    {
+        LogListBox.Items.Insert(0, $"[{DateTime.Now:HH:mm:ss}] {log}");
+        while (LogListBox.Items.Count > MaxLogEntries)
+        {
+            LogListBox.Items.RemoveAt(LogListBox.Items.Count - 1);
+        }
     }
 
     private void BrowseUploadPath_Click(object sender, RoutedEventArgs e)

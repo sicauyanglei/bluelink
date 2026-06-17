@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
@@ -116,11 +117,27 @@ public class TcpConnectedClient
     private readonly TcpClient _client;
 
     public string DeviceName => "TCP Client";
-    public string DeviceAddress => "Connected";
+    public string DeviceAddress
+    {
+        get
+        {
+            try
+            {
+                return _client.Client?.RemoteEndPoint?.ToString() ?? "Connected";
+            }
+            catch
+            {
+                return "Connected";
+            }
+        }
+    }
 
     public TcpConnectedClient(TcpClient client)
     {
         _client = client;
+        // Enforce a read timeout so idle/half-open clients do not hold a connection
+        // and a transfer task forever. Previously ReadAsync blocked indefinitely.
+        try { _client.ReceiveTimeout = 120000; } catch { }
     }
 
     public NetworkStream GetStream() => _client.GetStream();
@@ -132,23 +149,22 @@ public class TcpConnectedClient
             var stream = _client.GetStream();
             return await stream.ReadAsync(buffer, offset, count);
         }
-        catch
+        catch (Exception ex)
         {
+            Debug.WriteLine($"[TcpConnectedClient] ReadAsync error: {ex.GetType().Name}: {ex.Message}");
             return 0;
         }
     }
 
     public async Task WriteAsync(byte[] buffer, int offset, int count)
     {
-        try
-        {
-            var stream = _client.GetStream();
-            await stream.WriteAsync(buffer, offset, count);
-            await stream.FlushAsync();
-        }
-        catch
-        {
-        }
+        // Do NOT swallow exceptions silently. The previous empty catch hid
+        // disconnected clients from the caller, so the transfer loop kept
+        // "succeeding" while the client received nothing. Let the exception
+        // propagate so the FileTransferService loop can break and clean up.
+        var stream = _client.GetStream();
+        await stream.WriteAsync(buffer, offset, count);
+        await stream.FlushAsync();
     }
 
     public void Close()

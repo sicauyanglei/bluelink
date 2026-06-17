@@ -9,11 +9,20 @@ public class DiscoveryServer : IDisposable
     private UdpClient? _udpClient;
     private CancellationTokenSource? _cts;
     private bool _isRunning;
+    private readonly int _tcpPort;
 
     public event EventHandler<string>? DiscoveryStatusChanged;
 
     public const int DiscoveryPort = 9001;
     private const string DiscoveryMessage = "BLUELINK_DISCOVER";
+
+    // The TCP port advertised in discovery responses. Previously this was hardcoded
+    // to 9000, so if the user changed the TCP port in the UI the discovery response
+    // sent clients to the wrong port and connections failed.
+    public DiscoveryServer(int tcpPort = 9000)
+    {
+        _tcpPort = tcpPort;
+    }
 
     public void StartDiscovery()
     {
@@ -66,7 +75,7 @@ public class DiscoveryServer : IDisposable
                 {
                     // Get all local IP addresses
                     var allIPs = GetAllLocalIPAddresses();
-                    var response = Encoding.UTF8.GetBytes($"BLUELINK_RESPONSE|{allIPs}|9000");
+                    var response = Encoding.UTF8.GetBytes($"BLUELINK_RESPONSE|{allIPs}|{_tcpPort}");
                     await _udpClient.SendAsync(response, result.RemoteEndPoint, token);
                     DiscoveryStatusChanged?.Invoke(this, $"发送响应 to {result.RemoteEndPoint}: {allIPs}");
                 }
@@ -87,12 +96,18 @@ public class DiscoveryServer : IDisposable
         var ips = new List<string>();
         try
         {
-            var host = Dns.GetHostEntry(Dns.GetHostName());
-            foreach (var ip in host.AddressList)
+            // Enumerate network interfaces instead of Dns.GetHostEntry, which can be
+            // slow (reverse DNS) and may miss virtual adapters.
+            foreach (var nic in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
             {
-                if (ip.AddressFamily == AddressFamily.InterNetwork)
+                if (nic.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up) continue;
+                if (nic.NetworkInterfaceType == System.Net.NetworkInformation.NetworkInterfaceType.Loopback) continue;
+                foreach (var addr in nic.GetIPProperties().UnicastAddresses)
                 {
-                    ips.Add(ip.ToString());
+                    if (addr.Address.AddressFamily == AddressFamily.InterNetwork)
+                    {
+                        ips.Add(addr.Address.ToString());
+                    }
                 }
             }
         }

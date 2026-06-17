@@ -33,11 +33,13 @@ object HotspotDevices {
     // 调试日志回调
     var debugLog: ((String) -> Unit)? = null
 
-    // Android Context for system services
+    // Android Context for system services.
+    // Store the application context to avoid leaking an Activity through this
+    // singleton (the singleton outlives any Activity).
     private var androidContext: Context? = null
 
     fun setContext(context: Context) {
-        androidContext = context
+        androidContext = context.applicationContext
     }
 
     /**
@@ -370,14 +372,17 @@ object HotspotDevices {
      * 检查主机端口是否开放
      */
     private fun isPortOpen(ip: String, port: Int, timeout: Int): Boolean {
+        // Use try-finally to ensure the socket is closed even if connect() throws.
+        // Previously the socket leaked on any exception path.
+        val socket = java.net.Socket()
         return try {
-            val socket = java.net.Socket()
             socket.soTimeout = timeout
             socket.connect(java.net.InetSocketAddress(ip, port), timeout)
-            socket.close()
             true
         } catch (e: Exception) {
             false
+        } finally {
+            try { socket.close() } catch (_: Exception) { }
         }
     }
 
@@ -417,48 +422,6 @@ object HotspotDevices {
     }
 
     /**
-     * 扫描子网内的IP - 并行快速扫描
-     */
-    private suspend fun scanSubnetFast(subnet: String): List<Device> = withContext(Dispatchers.IO) {
-        val devices = mutableListOf<Device>()
-        val port = 9000
-
-        debugLog?.invoke("开始扫描子网: $subnet.x")
-
-        val jobs = mutableListOf<Deferred<Device?>>()
-
-        for (i in 1..254) {
-            val ip = "$subnet.$i"
-            jobs.add(async(Dispatchers.IO) {
-                try {
-                    val socket = java.net.Socket()
-                    socket.soTimeout = 150
-                    socket.connect(java.net.InetSocketAddress(ip, port), 150)
-                    socket.close()
-                    debugLog?.invoke("扫描发现设备: $ip (端口开放)")
-                    Device(ip = ip, mac = "Unknown", isReachable = true)
-                } catch (e: Exception) {
-                    null
-                }
-            })
-        }
-
-        jobs.forEach { job ->
-            try {
-                val device = job.await()
-                if (device != null) {
-                    devices.add(device)
-                }
-            } catch (e: Exception) {
-                // 忽略
-            }
-        }
-
-        debugLog?.invoke("扫描完成，发现 ${devices.size} 个设备")
-        devices
-    }
-
-    /**
      * 扫描指定子网内的IP - 并行快速扫描
      */
     suspend fun scanSubnet(subnet: String): List<Device> = withContext(Dispatchers.IO) {
@@ -471,15 +434,17 @@ object HotspotDevices {
         for (i in 1..254) {
             val ip = "$subnet.$i"
             jobs.add(async(Dispatchers.IO) {
+                // Use try-finally to ensure the socket is closed even if connect() throws.
+                val socket = java.net.Socket()
                 try {
-                    val socket = java.net.Socket()
                     socket.soTimeout = 150
                     socket.connect(java.net.InetSocketAddress(ip, port), 150)
-                    socket.close()
                     debugLog?.invoke("扫描发现设备: $ip (端口开放)")
                     Device(ip = ip, mac = "Unknown", isReachable = true)
                 } catch (e: Exception) {
                     null
+                } finally {
+                    try { socket.close() } catch (_: Exception) { }
                 }
             })
         }
@@ -531,7 +496,7 @@ object HotspotDevices {
         }
 
         for (subnet in subnetsToScan) {
-            val scannedDevices = scanSubnetFast(subnet)
+            val scannedDevices = scanSubnet(subnet)
             for (device in scannedDevices) {
                 if (!allDevices.any { it.ip == device.ip }) {
                     allDevices.add(device)

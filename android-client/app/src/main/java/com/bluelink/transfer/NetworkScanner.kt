@@ -187,14 +187,17 @@ object NetworkScanner {
 
     // Check if TCP port is open on target IP
     private fun isServerReachable(ip: String): Boolean {
+        // Use try-finally to ensure the socket is closed even if connect() throws.
+        // Previously the socket leaked on any exception path.
+        val socket = Socket()
         return try {
-            val socket = Socket()
             socket.soTimeout = TIMEOUT_MS
             socket.connect(java.net.InetSocketAddress(ip, TCP_PORT))
-            socket.close()
             true
         } catch (e: Exception) {
             false
+        } finally {
+            try { socket.close() } catch (_: Exception) { }
         }
     }
 }

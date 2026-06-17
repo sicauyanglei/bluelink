@@ -56,11 +56,7 @@ public class BluetoothServer : IDisposable
                 _listener.Start();
                 Debug.WriteLine("Listener started successfully");
 
-                // Wait a bit for listener to be ready
-                Thread.Sleep(500);
-
                 _isRunning = true;
-                ConnectionStatusChanged?.Invoke(this, $"蓝牙服务已启动，UUID={ServiceUuid}\n正在等待连接...");
 
                 // Start accepting clients in background
                 Task.Run(() => AcceptClientsAsync(_cts.Token), _cts.Token);
@@ -72,6 +68,11 @@ public class BluetoothServer : IDisposable
                 _isRunning = false;
             }
         }
+
+        // Invoke status event outside the lock to avoid potential deadlock if a
+        // handler calls back into the server. Previously this was inside the lock
+        // along with a Thread.Sleep(500) that blocked the UI thread for 500ms.
+        ConnectionStatusChanged?.Invoke(this, $"蓝牙服务已启动，UUID={ServiceUuid}\n正在等待连接...");
     }
 
     public void StopServer()
@@ -189,23 +190,20 @@ public class BluetoothConnectedClient
         {
             var stream = _client.GetStream();
 
-            // Use a timeout to prevent blocking forever
-            // 120 seconds (2 minutes) to allow large file transfers over Bluetooth
-            var timeoutTask = Task.Run(() => {
-                Thread.Sleep(120000); // 120 second timeout
-                return -1;
-            });
-
-            var readTask = stream.ReadAsync(buffer, offset, count);
-            var completedTask = await Task.WhenAny(readTask, timeoutTask);
-
-            if (completedTask == timeoutTask)
+            // Use CancellationTokenSource with a timeout instead of spawning a
+            // Thread.Sleep task. The previous implementation leaked a thread-pool
+            // thread for 120 seconds on every successful read (the timeout task was
+            // never cancelled), which exhausted the thread pool under load.
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(120));
+            try
+            {
+                return await stream.ReadAsync(buffer, offset, count, cts.Token);
+            }
+            catch (OperationCanceledException)
             {
                 Debug.WriteLine($"[BluetoothConnectedClient] ReadAsync timeout after 120s");
                 return -1;
             }
-
-            return await readTask;
         }
         catch (Exception ex)
         {
@@ -216,15 +214,13 @@ public class BluetoothConnectedClient
 
     public async Task WriteAsync(byte[] buffer, int offset, int count)
     {
-        try
-        {
-            var stream = _client.GetStream();
-            await stream.WriteAsync(buffer, offset, count);
-            await stream.FlushAsync();
-        }
-        catch
-        {
-        }
+        // Do NOT swallow exceptions silently. The previous empty catch hid
+        // disconnected clients from the caller, so the transfer loop kept
+        // "succeeding" while the client received nothing. Let the exception
+        // propagate so the FileTransferService loop can break and clean up.
+        var stream = _client.GetStream();
+        await stream.WriteAsync(buffer, offset, count);
+        await stream.FlushAsync();
     }
 
     public void Close()

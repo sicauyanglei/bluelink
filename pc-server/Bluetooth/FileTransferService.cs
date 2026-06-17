@@ -15,6 +15,12 @@ public class FileTransferService
     private readonly BluetoothConnectedClient _client;
     private readonly Dispatcher _dispatcher;
     private const int CHUNK_SIZE = 32768; // 32KB chunks for faster transfer
+    // Maximum payload size for a single command packet (prevents OOM from malicious/corrupted length).
+    private const int MAX_PACKET_PAYLOAD_SIZE = 64 * 1024 * 1024; // 64 MB
+    // Serializes all writes to the client stream. Without this, concurrent writers
+    // (e.g. a path-changed notification sent from the UI thread while a download is
+    // streaming chunks) interleave their bytes and corrupt the command|length|data framing.
+    private readonly SemaphoreSlim _writeLock = new SemaphoreSlim(1, 1);
 
     public event EventHandler<string>? LogReceived;
     public event EventHandler<TransferProgress>? ProgressChanged;
@@ -29,6 +35,30 @@ public class FileTransferService
 
     // Get absolute path of current directory
     private string GetAbsolutePath() => string.IsNullOrEmpty(_currentPath) ? _sharePath : Path.Combine(_sharePath, _currentPath);
+
+    // Validate that a resolved filesystem path stays within the given root directory.
+    // Prevents path-traversal attacks where a client sends "..", absolute paths, or
+    // drive letters to escape the share/upload root (arbitrary read/write/delete).
+    private bool IsPathWithinRoot(string root, string fullPath)
+    {
+        var normalizedRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var normalizedFull = Path.GetFullPath(fullPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return normalizedFull.Equals(normalizedRoot.TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase)
+            || normalizedFull.StartsWith(normalizedRoot, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // Validate a client-supplied file/folder name. Rejects anything that could escape
+    // the current directory: path separators, parent segments, absolute paths, drive letters.
+    private bool IsValidFileName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return false;
+        if (name.IndexOfAny(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar }) >= 0) return false;
+        if (name.Contains("..")) return false;
+        if (Path.IsPathRooted(name)) return false;
+        // Reject Windows drive-letter / UNC-style prefixes (e.g. "C:", "\\\\server").
+        if (name.Length >= 2 && name[1] == ':') return false;
+        return true;
+    }
 
     private void SafeLog(string msg)
     {
@@ -54,19 +84,12 @@ public class FileTransferService
         try
         {
             SafeLog("开始处理客户端...");
-            int loopCount = 0;
             while (true)
             {
-                loopCount++;
-                var loopStart = DateTime.Now;
-                SafeLog($"[Loop #{loopCount}] 开始 at {loopStart:HH:mm:ss.fff}");
                 try
                 {
                     // Read protocol header (5 bytes: 1 byte command + 4 bytes length)
-                    SafeLog($"[Loop #{loopCount}] 等待读取header...");
                     var headerBytes = await ReadExactAsync(5);
-                    var headerTime = DateTime.Now;
-                    SafeLog($"[Loop #{loopCount}] header读取完成 at {headerTime:HH:mm:ss.fff}, elapsed={headerTime-loopStart:mm\\:ss\\.fff}, result={(headerBytes == null ? "null" : headerBytes.Length + " bytes")}");
                     if (headerBytes == null || headerBytes.Length == 0) {
                         SafeLog("连接已断开，退出循环");
                         break;
@@ -74,13 +97,16 @@ public class FileTransferService
 
                     var command = headerBytes[0];
                     var length = FileTransferProtocol.ReadInt32BigEndian(headerBytes, 1);
-                    SafeLog($"[Loop #{loopCount}] 命令={command}, 长度={length}");
+
+                    // Validate payload length to prevent OOM from corrupted/malicious length fields.
+                    if (length < 0 || length > MAX_PACKET_PAYLOAD_SIZE)
+                    {
+                        SafeLog($"非法的数据包长度: {length} (最大 {MAX_PACKET_PAYLOAD_SIZE})，断开连接");
+                        break;
+                    }
 
                     // Read data based on length
-                    var dataStart = DateTime.Now;
                     var data = length > 0 ? await ReadExactAsync(length) : Array.Empty<byte>();
-                    var dataTime = DateTime.Now;
-                    SafeLog($"[Loop #{loopCount}] 数据读取完成 at {dataTime:HH:mm:ss.fff}, elapsed={dataTime-dataStart:mm\\:ss\\.fff}");
                     if (data == null) {
                         SafeLog("数据读取失败，退出循环");
                         break;
@@ -90,12 +116,12 @@ public class FileTransferService
                 }
                 catch (Exception ex)
                 {
-                    SafeLog($"[Loop #{loopCount}] 处理异常: {ex.Message}");
+                    SafeLog($"处理异常: {ex.Message}");
                     break;
                 }
             }
             var endTime = DateTime.Now;
-            SafeLog($"[HandleClientAsync] END at {endTime:HH:mm:ss.fff}, total={endTime-startTime:mm\\:ss\\.fff}");
+            SafeLog($"[HandleClientAsync] END, total={endTime-startTime:mm\\:ss\\.fff}");
         }
         catch (Exception ex)
         {
@@ -105,37 +131,31 @@ public class FileTransferService
 
     private async Task<byte[]?> ReadExactAsync(int count)
     {
-        var readStart = DateTime.Now;
-        SafeLog($"[ReadExact] START at {readStart:HH:mm:ss.fff}, count={count}");
         var buffer = new byte[count];
         var totalRead = 0;
-        int readAttempts = 0;
         while (totalRead < count)
         {
-            readAttempts++;
-            var attemptStart = DateTime.Now;
-            SafeLog($"[ReadExact] Attempt #{readAttempts} at {attemptStart:HH:mm:ss.fff}, waiting for {count - totalRead} bytes...");
             var read = await _client.ReadAsync(buffer, totalRead, count - totalRead);
-            var attemptEnd = DateTime.Now;
-            SafeLog($"[ReadExact] Attempt #{readAttempts} completed at {attemptEnd:HH:mm:ss.fff}, elapsed={attemptEnd-attemptStart:mm\\:ss\\.fff}, read={read}, totalRead={totalRead}/{count}");
             if (read <= 0) {
-                SafeLog($"[ReadExact] Read returned {read}, connection may be closed");
                 return null;
             }
             totalRead += read;
         }
-        var successEnd = DateTime.Now;
-        SafeLog($"[ReadExact] SUCCESS at {successEnd:HH:mm:ss.fff}, total elapsed={successEnd-readStart:mm\\:ss\\.fff}");
         return buffer;
     }
 
     private async Task WriteAsync(byte[] data)
     {
-        var writeStart = DateTime.Now;
-        SafeLog($"[WriteAsync] START at {writeStart:HH:mm:ss.fff}, length={data.Length}");
-        await _client.WriteAsync(data, 0, data.Length);
-        var writeEnd = DateTime.Now;
-        SafeLog($"[WriteAsync] END at {writeEnd:HH:mm:ss.fff}, elapsed={writeEnd-writeStart:mm\\:ss\\.fff}");
+        // Serialize writes so concurrent callers cannot interleave bytes on the stream.
+        await _writeLock.WaitAsync();
+        try
+        {
+            await _client.WriteAsync(data, 0, data.Length);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     private async Task ProcessCommandAsync(byte command, byte[] data)
@@ -262,7 +282,7 @@ public class FileTransferService
         }
 
         var folderNameLength = FileTransferProtocol.ReadInt32BigEndian(data, 0);
-        if (data.Length < 4 + folderNameLength)
+        if (folderNameLength < 0 || data.Length < 4 + folderNameLength)
         {
             await SendErrorAsync("数据格式错误");
             return;
@@ -289,9 +309,23 @@ public class FileTransferService
         }
         else
         {
+            // Reject path-traversal attempts before navigating.
+            if (!IsValidFileName(folderName))
+            {
+                await SendErrorAsync("无效的文件夹名称");
+                return;
+            }
+
             // Navigate into subdirectory
             var newPath = string.IsNullOrEmpty(_currentPath) ? folderName : Path.Combine(_currentPath, folderName);
             var newFullPath = Path.Combine(_sharePath, newPath);
+
+            // Containment check: ensure the resolved path stays within the share root.
+            if (!IsPathWithinRoot(_sharePath, newFullPath))
+            {
+                await SendErrorAsync("无效的文件夹名称");
+                return;
+            }
 
             if (!Directory.Exists(newFullPath))
             {
@@ -338,7 +372,7 @@ public class FileTransferService
         }
 
         var folderNameLength = FileTransferProtocol.ReadInt32BigEndian(data, 0);
-        if (data.Length < 4 + folderNameLength)
+        if (folderNameLength < 0 || data.Length < 4 + folderNameLength)
         {
             await SendErrorAsync("数据格式错误");
             return;
@@ -346,14 +380,21 @@ public class FileTransferService
 
         var folderName = Encoding.UTF8.GetString(data, 4, folderNameLength);
 
-        // Validate folder name
-        if (string.IsNullOrWhiteSpace(folderName) || folderName.Contains(Path.DirectorySeparatorChar) || folderName.Contains(Path.AltDirectorySeparatorChar))
+        // Validate folder name (rejects path separators, "..", absolute paths, drive letters).
+        if (!IsValidFileName(folderName))
         {
             await SendErrorAsync("无效的文件夹名称");
             return;
         }
 
         var newFolderPath = Path.Combine(GetAbsolutePath(), folderName);
+
+        // Containment check: ensure the resolved path stays within the share root.
+        if (!IsPathWithinRoot(_sharePath, newFolderPath))
+        {
+            await SendErrorAsync("无效的文件夹名称");
+            return;
+        }
 
         try
         {
@@ -385,7 +426,10 @@ public class FileTransferService
         }
 
         var fileNameLength = FileTransferProtocol.ReadInt32BigEndian(data, 0);
-        if (data.Length < 4 + fileNameLength)
+        // BUGFIX: the payload also contains an 8-byte offset after the filename.
+        // The previous check `data.Length < 4 + fileNameLength` allowed a payload
+        // with no offset bytes, causing ReadInt64BigEndian to throw IndexOutOfRangeException.
+        if (fileNameLength < 0 || data.Length < 4 + fileNameLength + 8)
         {
             await SendErrorAsync("数据格式错误");
             return;
@@ -393,7 +437,20 @@ public class FileTransferService
 
         var fileName = Encoding.UTF8.GetString(data, 4, fileNameLength);
         var offset = FileTransferProtocol.ReadInt64BigEndian(data, 4 + fileNameLength);
+
+        // Reject path-traversal attempts before touching the filesystem.
+        if (!IsValidFileName(fileName))
+        {
+            await SendErrorAsync("无效的文件名");
+            return;
+        }
+
         var filePath = Path.Combine(GetAbsolutePath(), fileName);
+        if (!IsPathWithinRoot(_sharePath, filePath))
+        {
+            await SendErrorAsync("无效的文件名");
+            return;
+        }
 
         if (!File.Exists(filePath))
         {
@@ -404,6 +461,14 @@ public class FileTransferService
 
         var fileInfo = new FileInfo(filePath);
         var totalSize = fileInfo.Length;
+
+        // Validate offset against file size. A negative or oversized offset previously
+        // caused IOException on Seek or produced a misleading empty transfer.
+        if (offset < 0 || offset > totalSize)
+        {
+            await SendErrorAsync("无效的偏移量");
+            return;
+        }
 
         // Report progress
         SafeProgress(new TransferProgress
@@ -462,7 +527,7 @@ public class FileTransferService
 
         var fileNameLength = FileTransferProtocol.ReadInt32BigEndian(data, 0);
         SafeLog($"BLUETOOTH UPLOAD: data.Length={data.Length}, fileNameLength={fileNameLength}");
-        if (data.Length < 4 + fileNameLength + 8)
+        if (fileNameLength < 0 || data.Length < 4 + fileNameLength + 8)
         {
             await SendErrorAsync("数据格式错误");
             return;
@@ -472,7 +537,20 @@ public class FileTransferService
         var offset = FileTransferProtocol.ReadInt64BigEndian(data, 4 + fileNameLength);
         var initialContent = data.Skip(4 + fileNameLength + 8).ToArray();
         SafeLog($"BLUETOOTH UPLOAD: fileName={fileName}, offset={offset}, initialContent.Length={initialContent.Length}");
+
+        // Reject path-traversal attempts before writing to the upload directory.
+        if (!IsValidFileName(fileName))
+        {
+            await SendErrorAsync("无效的文件名");
+            return;
+        }
+
         var filePath = Path.Combine(_uploadPath, fileName);
+        if (!IsPathWithinRoot(_uploadPath, filePath))
+        {
+            await SendErrorAsync("无效的文件名");
+            return;
+        }
 
         // Ensure upload directory exists
         if (!Directory.Exists(_uploadPath))
@@ -613,7 +691,20 @@ public class FileTransferService
     private async Task HandleDeleteRequestAsync(byte[] data)
     {
         var fileName = Encoding.UTF8.GetString(data);
+
+        // Reject path-traversal attempts before deleting.
+        if (!IsValidFileName(fileName))
+        {
+            await SendErrorAsync("无效的文件名");
+            return;
+        }
+
         var filePath = Path.Combine(GetAbsolutePath(), fileName);
+        if (!IsPathWithinRoot(_sharePath, filePath))
+        {
+            await SendErrorAsync("无效的文件名");
+            return;
+        }
 
         if (!File.Exists(filePath))
         {

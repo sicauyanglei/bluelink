@@ -15,6 +15,12 @@ public class TcpFileTransferService
     private readonly TcpConnectedClient _client;
     private readonly Dispatcher _dispatcher;
     private const int CHUNK_SIZE = 32768; // 32KB chunks for faster transfer
+    // Maximum payload size for a single command packet (prevents OOM from malicious/corrupted length).
+    private const int MAX_PACKET_PAYLOAD_SIZE = 64 * 1024 * 1024; // 64 MB
+    // Serializes all writes to the client stream. Without this, concurrent writers
+    // (e.g. a path-changed notification sent from the UI thread while a download is
+    // streaming chunks) interleave their bytes and corrupt the command|length|data framing.
+    private readonly SemaphoreSlim _writeLock = new SemaphoreSlim(1, 1);
 
     public event EventHandler<string>? LogReceived;
     public event EventHandler<TransferProgress>? ProgressChanged;
@@ -29,6 +35,30 @@ public class TcpFileTransferService
 
     // Get absolute path of current directory
     private string GetAbsolutePath() => string.IsNullOrEmpty(_currentPath) ? _sharePath : Path.Combine(_sharePath, _currentPath);
+
+    // Validate that a resolved filesystem path stays within the given root directory.
+    // Prevents path-traversal attacks where a client sends "..", absolute paths, or
+    // drive letters to escape the share/upload root (arbitrary read/write/delete).
+    private bool IsPathWithinRoot(string root, string fullPath)
+    {
+        var normalizedRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var normalizedFull = Path.GetFullPath(fullPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return normalizedFull.Equals(normalizedRoot.TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase)
+            || normalizedFull.StartsWith(normalizedRoot, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // Validate a client-supplied file/folder name. Rejects anything that could escape
+    // the current directory: path separators, parent segments, absolute paths, drive letters.
+    private bool IsValidFileName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return false;
+        if (name.IndexOfAny(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar }) >= 0) return false;
+        if (name.Contains("..")) return false;
+        if (Path.IsPathRooted(name)) return false;
+        // Reject Windows drive-letter / UNC-style prefixes (e.g. "C:", "\\\\server").
+        if (name.Length >= 2 && name[1] == ':') return false;
+        return true;
+    }
 
     private void SafeLog(string msg)
     {
@@ -63,14 +93,18 @@ public class TcpFileTransferService
             {
                 try
                 {
-                    SafeLog("TCP: 等待读取header...");
                     var headerBytes = await ReadExactAsync(5);
-                    SafeLog($"TCP: header读取完成: {(headerBytes == null ? "null" : headerBytes.Length + " bytes")}");
                     if (headerBytes == null || headerBytes.Length == 0) break;
 
                     var command = headerBytes[0];
                     var length = FileTransferProtocol.ReadInt32BigEndian(headerBytes, 1);
-                    SafeLog($"TCP: 命令={command}, 长度={length}");
+
+                    // Validate payload length to prevent OOM from corrupted/malicious length fields.
+                    if (length < 0 || length > MAX_PACKET_PAYLOAD_SIZE)
+                    {
+                        SafeLog($"TCP: 非法的数据包长度: {length} (最大 {MAX_PACKET_PAYLOAD_SIZE})，断开连接");
+                        break;
+                    }
 
                     var data = length > 0 ? await ReadExactAsync(length) : Array.Empty<byte>();
                     if (data == null) break;
@@ -98,8 +132,7 @@ public class TcpFileTransferService
         while (totalRead < count)
         {
             var read = await _client.ReadAsync(buffer, totalRead, count - totalRead);
-            SafeLog($"TCP ReadExact: read={read}, totalRead={totalRead}, count={count}");
-            if (read == 0) return null;
+            if (read <= 0) return null;
             totalRead += read;
         }
         return buffer;
@@ -107,7 +140,16 @@ public class TcpFileTransferService
 
     private async Task WriteAsync(byte[] data)
     {
-        await _client.WriteAsync(data, 0, data.Length);
+        // Serialize writes so concurrent callers cannot interleave bytes on the stream.
+        await _writeLock.WaitAsync();
+        try
+        {
+            await _client.WriteAsync(data, 0, data.Length);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     private async Task ProcessCommandAsync(byte command, byte[] data)
@@ -234,7 +276,7 @@ public class TcpFileTransferService
         }
 
         var folderNameLength = FileTransferProtocol.ReadInt32BigEndian(data, 0);
-        if (data.Length < 4 + folderNameLength)
+        if (folderNameLength < 0 || data.Length < 4 + folderNameLength)
         {
             await SendErrorAsync("数据格式错误");
             return;
@@ -261,9 +303,23 @@ public class TcpFileTransferService
         }
         else
         {
+            // Reject path-traversal attempts before navigating.
+            if (!IsValidFileName(folderName))
+            {
+                await SendErrorAsync("无效的文件夹名称");
+                return;
+            }
+
             // Navigate into subdirectory
             var newPath = string.IsNullOrEmpty(_currentPath) ? folderName : Path.Combine(_currentPath, folderName);
             var newFullPath = Path.Combine(_sharePath, newPath);
+
+            // Containment check: ensure the resolved path stays within the share root.
+            if (!IsPathWithinRoot(_sharePath, newFullPath))
+            {
+                await SendErrorAsync("无效的文件夹名称");
+                return;
+            }
 
             if (!Directory.Exists(newFullPath))
             {
@@ -310,7 +366,7 @@ public class TcpFileTransferService
         }
 
         var folderNameLength = FileTransferProtocol.ReadInt32BigEndian(data, 0);
-        if (data.Length < 4 + folderNameLength)
+        if (folderNameLength < 0 || data.Length < 4 + folderNameLength)
         {
             await SendErrorAsync("数据格式错误");
             return;
@@ -318,14 +374,21 @@ public class TcpFileTransferService
 
         var folderName = Encoding.UTF8.GetString(data, 4, folderNameLength);
 
-        // Validate folder name
-        if (string.IsNullOrWhiteSpace(folderName) || folderName.Contains(Path.DirectorySeparatorChar) || folderName.Contains(Path.AltDirectorySeparatorChar))
+        // Validate folder name (rejects path separators, "..", absolute paths, drive letters).
+        if (!IsValidFileName(folderName))
         {
             await SendErrorAsync("无效的文件夹名称");
             return;
         }
 
         var newFolderPath = Path.Combine(GetAbsolutePath(), folderName);
+
+        // Containment check: ensure the resolved path stays within the share root.
+        if (!IsPathWithinRoot(_sharePath, newFolderPath))
+        {
+            await SendErrorAsync("无效的文件夹名称");
+            return;
+        }
 
         try
         {
@@ -357,7 +420,10 @@ public class TcpFileTransferService
         }
 
         var fileNameLength = FileTransferProtocol.ReadInt32BigEndian(data, 0);
-        if (data.Length < 4 + fileNameLength)
+        // BUGFIX: the payload also contains an 8-byte offset after the filename.
+        // The previous check `data.Length < 4 + fileNameLength` allowed a payload
+        // with no offset bytes, causing ReadInt64BigEndian to throw IndexOutOfRangeException.
+        if (fileNameLength < 0 || data.Length < 4 + fileNameLength + 8)
         {
             await SendErrorAsync("数据格式错误");
             return;
@@ -365,7 +431,20 @@ public class TcpFileTransferService
 
         var fileName = Encoding.UTF8.GetString(data, 4, fileNameLength);
         var offset = FileTransferProtocol.ReadInt64BigEndian(data, 4 + fileNameLength);
+
+        // Reject path-traversal attempts before touching the filesystem.
+        if (!IsValidFileName(fileName))
+        {
+            await SendErrorAsync("无效的文件名");
+            return;
+        }
+
         var filePath = Path.Combine(GetAbsolutePath(), fileName);
+        if (!IsPathWithinRoot(_sharePath, filePath))
+        {
+            await SendErrorAsync("无效的文件名");
+            return;
+        }
 
         if (!File.Exists(filePath))
         {
@@ -376,6 +455,14 @@ public class TcpFileTransferService
 
         var fileInfo = new FileInfo(filePath);
         var totalSize = fileInfo.Length;
+
+        // Validate offset against file size. A negative or oversized offset previously
+        // caused IOException on Seek or produced a misleading empty transfer.
+        if (offset < 0 || offset > totalSize)
+        {
+            await SendErrorAsync("无效的偏移量");
+            return;
+        }
 
         SafeProgress(new TransferProgress
         {
@@ -431,7 +518,7 @@ public class TcpFileTransferService
 
         var fileNameLength = FileTransferProtocol.ReadInt32BigEndian(data, 0);
         SafeLog($"TCP UPLOAD: data.Length={data.Length}, fileNameLength={fileNameLength}");
-        if (data.Length < 4 + fileNameLength + 8)
+        if (fileNameLength < 0 || data.Length < 4 + fileNameLength + 8)
         {
             await SendErrorAsync("数据格式错误");
             return;
@@ -441,7 +528,20 @@ public class TcpFileTransferService
         var offset = FileTransferProtocol.ReadInt64BigEndian(data, 4 + fileNameLength);
         var initialContent = data.Skip(4 + fileNameLength + 8).ToArray();
         SafeLog($"TCP UPLOAD: fileName={fileName}, offset={offset}, initialContent.Length={initialContent.Length}");
+
+        // Reject path-traversal attempts before writing to the upload directory.
+        if (!IsValidFileName(fileName))
+        {
+            await SendErrorAsync("无效的文件名");
+            return;
+        }
+
         var filePath = Path.Combine(_uploadPath, fileName);
+        if (!IsPathWithinRoot(_uploadPath, filePath))
+        {
+            await SendErrorAsync("无效的文件名");
+            return;
+        }
 
         // Ensure upload directory exists
         if (!Directory.Exists(_uploadPath))
@@ -585,7 +685,20 @@ public class TcpFileTransferService
     private async Task HandleDeleteRequestAsync(byte[] data)
     {
         var fileName = Encoding.UTF8.GetString(data);
+
+        // Reject path-traversal attempts before deleting.
+        if (!IsValidFileName(fileName))
+        {
+            await SendErrorAsync("无效的文件名");
+            return;
+        }
+
         var filePath = Path.Combine(GetAbsolutePath(), fileName);
+        if (!IsPathWithinRoot(_sharePath, filePath))
+        {
+            await SendErrorAsync("无效的文件名");
+            return;
+        }
 
         if (!File.Exists(filePath))
         {
