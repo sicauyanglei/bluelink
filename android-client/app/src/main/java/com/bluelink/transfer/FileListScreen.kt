@@ -1577,6 +1577,71 @@ fun FileListScreen(
                                 val fileName = downloadedFiles[dlKey] ?: file.name
                                 installApk(context, fileName)
                             }
+                        } else null,
+                        onReDownload = if (isComplete && transferService != null) {
+                            {
+                                // 清除下载记录，允许重新下载
+                                downloadProgress = downloadProgress - dlKey
+                                downloadedFiles = downloadedFiles - dlKey
+                                val prefs = context.getSharedPreferences("file_transfer_prefs", android.content.Context.MODE_PRIVATE)
+                                val downloadedFilesStr = downloadedFiles.entries.joinToString(";;") { "${it.key}::${it.value}" }
+                                prefs.edit().putString("downloaded_files", downloadedFilesStr).apply()
+                                // 触发重新下载
+                                scope.launch {
+                                    downloadingFileName = file.name
+                                    downloadingProgress = 0f
+                                    downloadSpeed = ""
+                                    lastDownloadUpdateTime = System.currentTimeMillis()
+                                    lastDownloadUpdateBytes = 0L
+                                    statusMessage = "正在重新下载: ${file.name}"
+                                    val fileSize = file.size
+                                    val startTime = System.currentTimeMillis()
+                                    val result = transferService.downloadFileToFile(
+                                        context = context,
+                                        fileName = file.name,
+                                        offset = 0L,
+                                        onProgress = { received ->
+                                            scope.launch {
+                                                if (fileSize > 0) {
+                                                    val progress = (received.toFloat() / fileSize).coerceAtMost(1f)
+                                                    downloadingProgress = progress
+                                                    val currentTime = System.currentTimeMillis()
+                                                    val timeDiff = currentTime - lastDownloadUpdateTime
+                                                    if (timeDiff >= 500) {
+                                                        val bytesDiff = received - lastDownloadUpdateBytes
+                                                        val speed = if (timeDiff > 0) (bytesDiff * 1000L / timeDiff) else 0L
+                                                        downloadSpeed = formatSpeed(speed)
+                                                        lastDownloadUpdateTime = currentTime
+                                                        lastDownloadUpdateBytes = received
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    )
+                                    if (result.isSuccess) {
+                                        val downloadResult = result.getOrNull()
+                                        val totalBytes = downloadResult?.bytesDownloaded ?: 0L
+                                        val endTime = System.currentTimeMillis()
+                                        val elapsedMs = endTime - startTime
+                                        val speed = if (elapsedMs > 0) (totalBytes * 1000L / elapsedMs) else 0L
+                                        downloadSpeed = formatSpeed(speed)
+                                        val downloadedFileName = downloadResult?.actualFileName ?: file.name
+                                        downloadProgress = downloadProgress + (dlKey to totalBytes)
+                                        lastDownloadedFile = downloadedFileName
+                                        statusMessage = "重新下载完成: $downloadedFileName"
+                                        downloadedFiles = downloadedFiles + (dlKey to downloadedFileName)
+                                        val prefs2 = context.getSharedPreferences("file_transfer_prefs", android.content.Context.MODE_PRIVATE)
+                                        val downloadedFilesStr2 = downloadedFiles.entries.joinToString(";;") { "${it.key}::${it.value}" }
+                                        prefs2.edit().putString("downloaded_files", downloadedFilesStr2).apply()
+                                    } else {
+                                        val errorMsg = result.exceptionOrNull()?.message ?: ""
+                                        statusMessage = "重新下载失败: $errorMsg"
+                                    }
+                                    downloadingFileName = null
+                                    downloadingProgress = 0f
+                                    downloadSpeed = ""
+                                }
+                            }
                         } else null
                     )
                 }
@@ -2190,6 +2255,7 @@ fun FileItemCard(
     isSelected: Boolean = false,
     onSelectToggle: (() -> Unit)? = null,
     onDownload: () -> Unit,
+    onReDownload: (() -> Unit)? = null,
     onDelete: (() -> Unit)? = null,
     actualFileName: String? = null,
     onInstall: (() -> Unit)? = null
@@ -2205,6 +2271,7 @@ fun FileItemCard(
         isSelected = isSelected,
         onSelectToggle = onSelectToggle,
         onDownload = onDownload,
+        onReDownload = onReDownload,
         onDelete = onDelete,
         actualFileName = actualFileName,
         onInstall = onInstall
@@ -2223,6 +2290,7 @@ private fun FileItemCardContent(
     isSelected: Boolean = false,
     onSelectToggle: (() -> Unit)? = null,
     onDownload: () -> Unit,
+    onReDownload: (() -> Unit)? = null,
     onDelete: (() -> Unit)? = null,
     actualFileName: String? = null,
     onInstall: (() -> Unit)? = null
@@ -2396,6 +2464,24 @@ private fun FileItemCardContent(
                                file.name.lowercase().endsWith(".apk")
                     if (isApk && onInstall != null) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
+                            // 重新下载按钮
+                            onReDownload?.let { reDownload ->
+                                FilledTonalIconButton(
+                                    onClick = reDownload,
+                                    modifier = Modifier.size(36.dp),
+                                    colors = IconButtonDefaults.filledTonalIconButtonColors(
+                                        containerColor = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.5f)
+                                    )
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Refresh,
+                                        contentDescription = "重新下载",
+                                        tint = MaterialTheme.colorScheme.tertiary,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(4.dp))
+                            }
                             Icon(
                                 imageVector = Icons.Default.CheckCircle,
                                 contentDescription = "已下载",
@@ -2419,12 +2505,32 @@ private fun FileItemCardContent(
                             }
                         }
                     } else {
-                        Icon(
-                            imageVector = Icons.Default.CheckCircle,
-                            contentDescription = "已下载",
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(22.dp)
-                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            // 重新下载按钮
+                            onReDownload?.let { reDownload ->
+                                FilledTonalIconButton(
+                                    onClick = reDownload,
+                                    modifier = Modifier.size(36.dp),
+                                    colors = IconButtonDefaults.filledTonalIconButtonColors(
+                                        containerColor = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.5f)
+                                    )
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Refresh,
+                                        contentDescription = "重新下载",
+                                        tint = MaterialTheme.colorScheme.tertiary,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(4.dp))
+                            }
+                            Icon(
+                                imageVector = Icons.Default.CheckCircle,
+                                contentDescription = "已下载",
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(22.dp)
+                            )
+                        }
                     }
                 } else {
                     FilledTonalIconButton(

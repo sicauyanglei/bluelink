@@ -20,6 +20,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import kotlinx.coroutines.launch
@@ -60,6 +61,15 @@ class MainActivity : ComponentActivity() {
     val tcpPort get() = _tcpPort
     val debugLogs get() = _debugLogs
     val showDebugLog get() = _showDebugLog
+
+    companion object {
+        private const val PREFS_NAME = "bluelink_connection_prefs"
+        private const val KEY_CONN_TYPE = "conn_type" // "tcp" or "bluetooth"
+        private const val KEY_TCP_HOST = "tcp_host"
+        private const val KEY_TCP_PORT = "tcp_port"
+        private const val KEY_BT_DEVICE_ADDR = "bt_device_addr"
+        private const val KEY_BT_DEVICE_NAME = "bt_device_name"
+    }
 
     fun addDebugLog(msg: String) {
         val timestamp = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())
@@ -122,6 +132,90 @@ class MainActivity : ComponentActivity() {
 
     fun triggerPathRefresh() {
         _pathChangedTrigger++
+    }
+
+    private fun saveConnectionInfo(connType: String, host: String, port: String, btDeviceAddr: String? = null, btDeviceName: String? = null) {
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+        prefs.putString(KEY_CONN_TYPE, connType)
+        prefs.putString(KEY_TCP_HOST, host)
+        prefs.putString(KEY_TCP_PORT, port)
+        if (btDeviceAddr != null) prefs.putString(KEY_BT_DEVICE_ADDR, btDeviceAddr)
+        if (btDeviceName != null) prefs.putString(KEY_BT_DEVICE_NAME, btDeviceName)
+        prefs.apply()
+        addDebugLog(">>> 保存连接信息: type=$connType, host=$host, port=$port")
+    }
+
+    private fun clearConnectionInfo() {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().clear().apply()
+        addDebugLog(">>> 清除连接信息")
+    }
+
+    private fun tryAutoReconnect() {
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val connType = prefs.getString(KEY_CONN_TYPE, null) ?: return
+        addDebugLog(">>> 尝试自动重连, connType=$connType")
+
+        when (connType) {
+            "tcp" -> {
+                val host = prefs.getString(KEY_TCP_HOST, "") ?: ""
+                val port = prefs.getString(KEY_TCP_PORT, "9000") ?: "9000"
+                if (host.isNotEmpty()) {
+                    _tcpHost = host
+                    _tcpPort = port
+                    lifecycleScope.launch {
+                        try {
+                            addDebugLog(">>> 自动重连TCP: $host:$port")
+                            val tcpClient = TcpClient()
+                            val service = FileTransferService(tcpClient)
+                            val result = tcpClient.connect(host, port.toInt())
+                            if (result.isSuccess) {
+                                _tcpClient = tcpClient
+                                _bluetoothClient = null
+                                _transferService = service
+                                _connectionStateVersion++
+                                service.onPathChanged = { _pathChangedTrigger++ }
+                                addDebugLog(">>> TCP自动重连成功")
+                            } else {
+                                addDebugLog(">>> TCP自动重连失败: ${result.exceptionOrNull()?.message}")
+                            }
+                        } catch (e: Exception) {
+                            addDebugLog(">>> TCP自动重连失败: ${e.message}")
+                        }
+                    }
+                }
+            }
+            "bluetooth" -> {
+                val deviceAddr = prefs.getString(KEY_BT_DEVICE_ADDR, null)
+                val deviceName = prefs.getString(KEY_BT_DEVICE_NAME, null)
+                if (deviceAddr != null) {
+                    val bluetoothManager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
+                    val bluetoothAdapter = bluetoothManager.adapter
+                    val device = bluetoothManager.adapter?.getRemoteDevice(deviceAddr)
+                    if (device != null && bluetoothAdapter != null) {
+                        lifecycleScope.launch {
+                            try {
+                                addDebugLog(">>> 自动重连蓝牙: $deviceName ($deviceAddr)")
+                                val btClient = BluetoothClient(bluetoothAdapter)
+                                val service = FileTransferService(btClient)
+                                val result = btClient.connect(device)
+                                if (result.isSuccess) {
+                                    _bluetoothClient = btClient
+                                    _tcpClient = null
+                                    _transferService = service
+                                    _connectionStateVersion++
+                                    service.onPathChanged = { _pathChangedTrigger++ }
+                                    addDebugLog(">>> 蓝牙自动重连成功")
+                                } else {
+                                    addDebugLog(">>> 蓝牙自动重连失败: ${result.exceptionOrNull()?.message}")
+                                }
+                            } catch (e: Exception) {
+                                addDebugLog(">>> 蓝牙自动重连失败: ${e.message}")
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private val requiredPermissions = when {
@@ -213,19 +307,22 @@ class MainActivity : ComponentActivity() {
 
         val btClient = _bluetoothClient
         val tcpCli = _tcpClient
+
+        // If clients are null but we have saved connection info, try auto-reconnect
+        // (Activity was destroyed and recreated)
+        if (btClient == null && tcpCli == null && _transferService == null) {
+            addDebugLog(">>> onResume: 客户端为空，尝试自动重连")
+            tryAutoReconnect()
+            return
+        }
+
+        // If clients exist but disconnected, let ConnectScreen/DeviceScanScreen handle reconnection
+        // via their own ON_RESUME lifecycle observers to avoid duplicate reconnection attempts
         val btDisconnected = btClient != null && !btClient.isConnected
         val tcpDisconnected = tcpCli != null && !tcpCli.isConnected
 
         if (btDisconnected && tcpDisconnected) {
-            if (btClient?.isReconnecting != true && tcpCli?.isReconnecting != true) {
-                if (btClient?.hasConnectionInfo == true) {
-                    addDebugLog(">>> onResume: 触发蓝牙后台重连")
-                    lifecycleScope.launch { btClient.autoReconnect() }
-                } else if (tcpCli?.hasConnectionInfo == true) {
-                    addDebugLog(">>> onResume: 触发TCP后台重连")
-                    lifecycleScope.launch { tcpCli.autoReconnect() }
-                }
-            }
+            addDebugLog(">>> onResume: 连接已断开，等待子组件触发重连")
         }
     }
 
@@ -282,6 +379,11 @@ class MainActivity : ComponentActivity() {
                             service.onPathChanged = {
                                 _pathChangedTrigger++
                             }
+                            // Save connection info for auto-reconnect
+                            val device = client.lastConnectedDevice
+                            saveConnectionInfo("bluetooth", "", "9000",
+                                btDeviceAddr = device?.address,
+                                btDeviceName = device?.name)
                             addDebugLog("蓝牙连接成功")
                         },
                         onTcpConnected = { client, service ->
@@ -292,6 +394,8 @@ class MainActivity : ComponentActivity() {
                             service.onPathChanged = {
                                 _pathChangedTrigger++
                             }
+                            // Save connection info for auto-reconnect
+                            saveConnectionInfo("tcp", _tcpHost, _tcpPort)
                             addDebugLog("TCP连接成功")
                         },
                         onDisconnect = {
@@ -301,6 +405,7 @@ class MainActivity : ComponentActivity() {
                             _tcpClient = null
                             _transferService = null
                             _connectionStateVersion++
+                            clearConnectionInfo()
                             addDebugLog("连接已断开")
                         },
                         onReconnecting = {
@@ -312,9 +417,14 @@ class MainActivity : ComponentActivity() {
                             if (client is TcpClient) {
                                 _tcpClient = client
                                 _bluetoothClient = null
+                                saveConnectionInfo("tcp", _tcpHost, _tcpPort)
                             } else if (client is BluetoothClient) {
                                 _bluetoothClient = client
                                 _tcpClient = null
+                                val device = client.lastConnectedDevice
+                                saveConnectionInfo("bluetooth", "", "9000",
+                                    btDeviceAddr = device?.address,
+                                    btDeviceName = device?.name)
                             }
                             _transferService = service
                             _connectionStateVersion++
@@ -390,7 +500,7 @@ fun MainScreen(
     onTriggerPathRefresh: () -> Unit = {}
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
-    var selectedTab by remember { mutableStateOf(0) }
+    var selectedTab by rememberSaveable { mutableStateOf(0) }
     val scope = rememberCoroutineScope()
     val lifecycleOwner = LocalLifecycleOwner.current
 
@@ -407,6 +517,13 @@ fun MainScreen(
     val isClientReconnecting = bluetoothClient?.isReconnecting == true || tcpClient?.isReconnecting == true
     val hasClient = bluetoothClient != null || tcpClient != null
     val isConnected = actualBluetoothConnected || actualTcpConnected
+
+    // Auto-switch to file tab when connection established
+    LaunchedEffect(isConnected) {
+        if (isConnected) {
+            selectedTab = 2
+        }
+    }
 
     val connectionStatus = when {
         isClientReconnecting -> "正在重连..."
@@ -600,6 +717,7 @@ fun MainScreen(
                 onReconnecting = onReconnecting,
                 onReconnected = { client, service ->
                     onReconnected(client, service)
+                    selectedTab = 2
                 },
                 isConnected = bluetoothClient?.isConnected == true,
                 visible = selectedTab == 0
@@ -618,6 +736,7 @@ fun MainScreen(
                 onReconnecting = onReconnecting,
                 onReconnected = { client, service ->
                     onReconnected(client, service)
+                    selectedTab = 2
                 },
                 isConnected = tcpClient?.isConnected == true,
                 tabVisible = selectedTab == 1,

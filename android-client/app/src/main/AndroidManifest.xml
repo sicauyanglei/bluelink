@@ -29,6 +29,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode|smallestScreenSize|screenLayout"
             android:theme="@style/Theme.BluetoothTransfer">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

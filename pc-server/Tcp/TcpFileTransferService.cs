@@ -453,6 +453,8 @@ public class TcpFileTransferService
         long totalReceived = 0;
         long existingSize = File.Exists(filePath) ? new FileInfo(filePath).Length : 0;
 
+        try
+        {
         // If initial content is empty, this might be streaming mode (header only, data follows separately)
         if (initialContent.Length == 0 && offset == 0)
         {
@@ -573,6 +575,15 @@ public class TcpFileTransferService
                 TotalBytes = totalSize,
                 TransferredBytes = totalSize
             });
+        }
+        }
+        catch (Exception ex)
+        {
+            SafeLog($"TCP UPLOAD ERROR: 写入文件失败: {fileName}, 错误: {ex.Message}");
+            // Clean up partial file
+            try { if (File.Exists(filePath)) File.Delete(filePath); } catch { }
+            await SendErrorAsync($"写入文件失败: {ex.Message}");
+            return;
         }
 
         SafeLog($"TCP: 准备发送成功响应...");

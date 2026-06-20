@@ -195,12 +195,17 @@ fun ConnectScreen(
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                // 检查实际连接状态，如果已断开则通知父组件更新UI
-                val actualConnected = currentTcpClient?.isConnected == true
-                android.util.Log.d("ConnectScreen", ">>> ON_RESUME: currentTcpClient=${currentTcpClient}, isConnected=$actualConnected")
-                if (currentTcpClient != null && !actualConnected) {
-                    android.util.Log.d("ConnectScreen", ">>> 检测到连接已断开")
-                    onDisconnect?.invoke()
+                // 主动检测连接是否真正可用
+                val actualConnected = currentTcpClient?.checkConnection() == true
+                android.util.Log.d("ConnectScreen", ">>> ON_RESUME: currentTcpClient=${currentTcpClient}, checkConnection=$actualConnected")
+                if (currentTcpClient != null && !actualConnected && currentTcpClient?.isReconnecting != true) {
+                    android.util.Log.d("ConnectScreen", ">>> 检测到连接已断开，触发重连")
+                    // 通知父组件连接断开，但不清除连接信息
+                    onReconnecting()
+                    // 触发自动重连（仅在此处触发，避免重复）
+                    if (currentTcpClient?.hasConnectionInfo == true) {
+                        scope.launch { currentTcpClient?.autoReconnect() }
+                    }
                 }
             }
         }

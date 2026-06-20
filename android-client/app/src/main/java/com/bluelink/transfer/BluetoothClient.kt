@@ -31,7 +31,8 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
     private var outputStream: OutputStream? = null
     var toast: ((String) -> Unit)? = null
 
-    private var lastConnectedDevice: BluetoothDevice? = null
+    var lastConnectedDevice: BluetoothDevice? = null
+        private set
     var onDisconnected: (() -> Unit)? = null
     var onReconnecting: ((attempt: Int) -> Unit)? = null
     var onReconnected: (() -> Unit)? = null
@@ -237,16 +238,23 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
 
     override suspend fun readPacket(): ByteArray? = withContext(Dispatchers.IO) {
         try {
-            val header = ByteArray(5)
-            Log.d(TAG, "[${System.currentTimeMillis()%100000}] readPacket: waiting for header...")
-            val headerRead = inputStream?.read(header) ?: run {
+            val input = inputStream
+            if (input == null) {
                 handleReadError()
                 return@withContext null
             }
-            Log.d(TAG, "[${System.currentTimeMillis()%100000}] readPacket: headerRead=$headerRead")
-            if (headerRead != 5) {
-                handleReadError()
-                return@withContext null
+
+            // 循环读取完整的5字节header（蓝牙也是流式传输，可能一次读不完）
+            val header = ByteArray(5)
+            var headerOffset = 0
+            while (headerOffset < 5) {
+                val read = input.read(header, headerOffset, 5 - headerOffset)
+                if (read <= 0) {
+                    Log.e(TAG, "readPacket: header read failed at offset=$headerOffset")
+                    handleReadError()
+                    return@withContext null
+                }
+                headerOffset += read
             }
 
             val length = ((header[1].toInt() and 0xFF) shl 24) or
@@ -254,26 +262,24 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
                         ((header[3].toInt() and 0xFF) shl 8) or
                         (header[4].toInt() and 0xFF)
 
-            Log.d(TAG, "[${System.currentTimeMillis()%100000}] readPacket: cmd=${header[0]}, len=$length")
             if (length <= 0) return@withContext header
 
+            // 循环读取完整的data部分
             val data = ByteArray(length)
             var offset = 0
             while (offset < length) {
-                val read = inputStream?.read(data, offset, length - offset) ?: 0
+                val read = input.read(data, offset, length - offset)
                 if (read <= 0) {
-                    Log.w(TAG, "read returned $read, connection may be closed")
+                    Log.w(TAG, "read returned $read at offset=$offset, connection may be closed")
                     handleReadError()
                     return@withContext null
                 }
                 offset += read
             }
 
-            Log.d(TAG, "readPacket: cmd=${header[0]}, len=$length, totalRead=${5+length}")
             header + data
         } catch (e: Exception) {
             Log.e(TAG, "readPacket error: ${e.javaClass.simpleName}: ${e.message}")
-            toast?.invoke("读取异常: ${e.message}")
             handleReadError()
             null
         }

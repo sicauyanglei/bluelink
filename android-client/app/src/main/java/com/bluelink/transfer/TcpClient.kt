@@ -2,6 +2,8 @@ package com.bluelink.transfer
 
 import android.util.Log
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.*
 import java.net.*
 
@@ -10,7 +12,7 @@ class TcpClient : TransferClient {
         private const val TAG = "TcpClient"
         private const val MAX_RECONNECT_ATTEMPTS = 3
         private const val RECONNECT_DELAY_MS = 2000L
-        private const val HEARTBEAT_INTERVAL_MS = 30000L
+        private const val HEARTBEAT_INTERVAL_MS = 15000L
         private const val HEARTBEAT_TIMEOUT_MS = 10000L
         private const val BACKGROUND_RECONNECT_INTERVAL_MS = 5000L
     }
@@ -28,11 +30,32 @@ class TcpClient : TransferClient {
     private var heartBeatJob: kotlinx.coroutines.Job? = null
     private var backgroundReconnectJob: kotlinx.coroutines.Job? = null
     private var isManuallyDisconnected = false
+    private val reconnectMutex = Mutex()
 
     private var _isReconnecting = false
     override val isReconnecting: Boolean get() = _isReconnecting
 
     override val isConnected: Boolean get() = socket?.isConnected == true && !_isReconnecting
+
+    /**
+     * 主动检测连接是否真正可用（发送一个心跳包）
+     * 返回 true 表示连接可用，false 表示连接已断开
+     */
+    fun checkConnection(): Boolean {
+        val s = socket
+        if (s == null || !s.isConnected || _isReconnecting) return false
+        return try {
+            // 检查 socket 是否有错误
+            if (s.isClosed) return false
+            // 尝试发送心跳包（0x00）
+            outputStream?.write(byteArrayOf(0x00))
+            outputStream?.flush()
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "checkConnection: failed: ${e.message}")
+            false
+        }
+    }
 
     override val hasConnectionInfo: Boolean get() = lastHost != null && lastPort != null
 
@@ -72,56 +95,75 @@ class TcpClient : TransferClient {
     }
 
     override suspend fun autoReconnect(): Result<Unit> = withContext(Dispatchers.IO) {
-        val host = lastHost
-        val port = lastPort
-        if (host == null || port == null) {
-            Log.d(TAG, "autoReconnect: no last host/port")
-            return@withContext Result.failure(Exception("无上次连接信息"))
+        // 防止多个autoReconnect同时运行
+        if (!reconnectMutex.tryLock()) {
+            Log.d(TAG, "autoReconnect: another reconnection in progress, skipping")
+            return@withContext Result.failure(Exception("已有重连进行中"))
         }
 
-        _isReconnecting = true
-        for (attempt in 1..MAX_RECONNECT_ATTEMPTS) {
-            Log.d(TAG, "autoReconnect: attempt $attempt of $MAX_RECONNECT_ATTEMPTS")
-            onReconnecting?.invoke(attempt)
+        try {
+            val host = lastHost
+            val port = lastPort
+            if (host == null || port == null) {
+                Log.d(TAG, "autoReconnect: no last host/port")
+                return@withContext Result.failure(Exception("无上次连接信息"))
+            }
 
-            try {
-                socket?.close()
-                socket = null
-                inputStream = null
-                outputStream = null
+            if (isManuallyDisconnected) {
+                Log.d(TAG, "autoReconnect: manually disconnected, abort")
+                return@withContext Result.failure(Exception("已手动断开"))
+            }
 
-                socket = Socket()
-                socket?.apply {
-                    tcpNoDelay = true
-                    soTimeout = 60000
-                    sendBufferSize = 524288
-                    receiveBufferSize = 524288
-                    keepAlive = true
-                }
-                socket?.connect(java.net.InetSocketAddress(host, port), 10000)
+            // 停止后台重连，避免冲突
+            stopBackgroundReconnect()
 
-                inputStream = socket?.getInputStream()
-                outputStream = socket?.getOutputStream()
+            Log.d(TAG, "autoReconnect: starting, host=$host, port=$port")
+            _isReconnecting = true
+            for (attempt in 1..MAX_RECONNECT_ATTEMPTS) {
+                Log.d(TAG, "autoReconnect: attempt $attempt of $MAX_RECONNECT_ATTEMPTS")
+                onReconnecting?.invoke(attempt)
 
-                Log.d(TAG, "autoReconnect: success on attempt $attempt")
-                _isReconnecting = false
-                startHeartBeat()
-                onReconnected?.invoke()
-                return@withContext Result.success(Unit)
-            } catch (e: Exception) {
-                Log.e(TAG, "autoReconnect: attempt $attempt failed: ${e.message}")
+                try {
+                    socket?.close()
+                    socket = null
+                    inputStream = null
+                    outputStream = null
 
-                if (attempt < MAX_RECONNECT_ATTEMPTS) {
-                    delay(RECONNECT_DELAY_MS)
+                    socket = Socket()
+                    socket?.apply {
+                        tcpNoDelay = true
+                        soTimeout = 60000
+                        sendBufferSize = 524288
+                        receiveBufferSize = 524288
+                        keepAlive = true
+                    }
+                    socket?.connect(java.net.InetSocketAddress(host, port), 10000)
+
+                    inputStream = socket?.getInputStream()
+                    outputStream = socket?.getOutputStream()
+
+                    Log.d(TAG, "autoReconnect: success on attempt $attempt")
+                    _isReconnecting = false
+                    startHeartBeat()
+                    onReconnected?.invoke()
+                    return@withContext Result.success(Unit)
+                } catch (e: Exception) {
+                    Log.e(TAG, "autoReconnect: attempt $attempt failed: ${e.message}")
+
+                    if (attempt < MAX_RECONNECT_ATTEMPTS) {
+                        delay(RECONNECT_DELAY_MS)
+                    }
                 }
             }
-        }
 
-        Log.d(TAG, "autoReconnect: all attempts exhausted, starting background reconnect")
-        _isReconnecting = false
-        onDisconnected?.invoke()
-        startBackgroundReconnect()
-        Result.failure(Exception("重连失败，后台继续尝试"))
+            Log.d(TAG, "autoReconnect: all attempts exhausted, starting background reconnect")
+            _isReconnecting = false
+            onDisconnected?.invoke()
+            startBackgroundReconnect()
+            Result.failure(Exception("重连失败，后台继续尝试"))
+        } finally {
+            reconnectMutex.unlock()
+        }
     }
 
     private fun startBackgroundReconnect() {
@@ -225,14 +267,23 @@ class TcpClient : TransferClient {
 
     override suspend fun readPacket(): ByteArray? = withContext(Dispatchers.IO) {
         try {
-            val header = ByteArray(5)
-            val headerRead = inputStream?.read(header) ?: run {
+            val input = inputStream
+            if (input == null) {
                 handleReadError()
                 return@withContext null
             }
-            if (headerRead != 5) {
-                handleReadError()
-                return@withContext null
+
+            // 循环读取完整的5字节header（TCP是流式协议，可能一次读不完）
+            val header = ByteArray(5)
+            var headerOffset = 0
+            while (headerOffset < 5) {
+                val read = input.read(header, headerOffset, 5 - headerOffset)
+                if (read <= 0) {
+                    Log.e(TAG, "readPacket: header read failed at offset=$headerOffset")
+                    handleReadError()
+                    return@withContext null
+                }
+                headerOffset += read
             }
 
             val length = ((header[1].toInt() and 0xFF) shl 24) or
@@ -242,11 +293,13 @@ class TcpClient : TransferClient {
 
             if (length <= 0) return@withContext header
 
+            // 循环读取完整的data部分
             val data = ByteArray(length)
             var offset = 0
             while (offset < length) {
-                val read = inputStream?.read(data, offset, length - offset) ?: 0
+                val read = input.read(data, offset, length - offset)
                 if (read <= 0) {
+                    Log.e(TAG, "readPacket: data read failed at offset=$offset, expected=$length")
                     handleReadError()
                     return@withContext null
                 }
@@ -254,6 +307,9 @@ class TcpClient : TransferClient {
             }
 
             header + data
+        } catch (e: SocketTimeoutException) {
+            Log.w(TAG, "readPacket: socket timeout, returning null")
+            null
         } catch (e: Exception) {
             Log.e(TAG, "readPacket error: ${e.message}")
             handleReadError()
