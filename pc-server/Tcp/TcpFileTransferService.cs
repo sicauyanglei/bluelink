@@ -112,6 +112,12 @@ public class TcpFileTransferService
 
     private async Task ProcessCommandAsync(byte command, byte[] data)
     {
+        // 心跳包（命令0x00），忽略不处理
+        if (command == 0x00)
+        {
+            return;
+        }
+
         switch (command)
         {
             case FileTransferProtocol.CMD_LIST_REQUEST:

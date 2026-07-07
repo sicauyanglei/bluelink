@@ -10,11 +10,12 @@ import java.net.*
 class TcpClient : TransferClient {
     companion object {
         private const val TAG = "TcpClient"
-        private const val MAX_RECONNECT_ATTEMPTS = 3
-        private const val RECONNECT_DELAY_MS = 2000L
-        private const val HEARTBEAT_INTERVAL_MS = 15000L
-        private const val HEARTBEAT_TIMEOUT_MS = 10000L
-        private const val BACKGROUND_RECONNECT_INTERVAL_MS = 5000L
+        private const val MAX_RECONNECT_ATTEMPTS = 5
+        private const val HEARTBEAT_INTERVAL_MS = 5000L
+        private const val HEARTBEAT_TIMEOUT_MS = 8000L
+        private const val BACKGROUND_RECONNECT_INTERVAL_MS = 2000L
+        private const val CONNECT_TIMEOUT_MS = 5000
+        private const val SOCKET_READ_TIMEOUT_MS = 30000
     }
 
     private var socket: Socket? = null
@@ -35,7 +36,9 @@ class TcpClient : TransferClient {
     private var _isReconnecting = false
     override val isReconnecting: Boolean get() = _isReconnecting
 
-    override val isConnected: Boolean get() = socket?.isConnected == true && !_isReconnecting
+    // socket.isConnected 只表示"曾经连接过"，需要结合 !isClosed 和 outputStream 判断
+    override val isConnected: Boolean get() =
+        socket?.let { it.isConnected && !it.isClosed } == true && outputStream != null && !_isReconnecting
 
     /**
      * 主动检测连接是否真正可用（发送一个心跳包）
@@ -44,11 +47,10 @@ class TcpClient : TransferClient {
     fun checkConnection(): Boolean {
         val s = socket
         if (s == null || !s.isConnected || _isReconnecting) return false
+        if (s.isClosed) return false
         return try {
-            // 检查 socket 是否有错误
-            if (s.isClosed) return false
-            // 尝试发送心跳包（0x00）
-            outputStream?.write(byteArrayOf(0x00))
+            // 发送心跳包：5字节header（命令0x00 + 长度0），符合协议格式
+            outputStream?.write(byteArrayOf(0x00, 0x00, 0x00, 0x00, 0x00))
             outputStream?.flush()
             true
         } catch (e: Exception) {
@@ -70,13 +72,13 @@ class TcpClient : TransferClient {
 
             socket?.apply {
                 tcpNoDelay = true
-                soTimeout = 60000
+                soTimeout = SOCKET_READ_TIMEOUT_MS
                 sendBufferSize = 524288
                 receiveBufferSize = 524288
                 keepAlive = true
             }
 
-            socket?.connect(java.net.InetSocketAddress(host, port), 10000)
+            socket?.connect(java.net.InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
 
             inputStream = socket?.getInputStream()
             outputStream = socket?.getOutputStream()
@@ -101,6 +103,7 @@ class TcpClient : TransferClient {
             return@withContext Result.failure(Exception("已有重连进行中"))
         }
 
+        val result: Result<Unit>
         try {
             val host = lastHost
             val port = lastPort
@@ -119,51 +122,61 @@ class TcpClient : TransferClient {
 
             Log.d(TAG, "autoReconnect: starting, host=$host, port=$port")
             _isReconnecting = true
+            onReconnecting?.invoke(1)  // 只通知一次UI
+            var reconnected = false
             for (attempt in 1..MAX_RECONNECT_ATTEMPTS) {
                 Log.d(TAG, "autoReconnect: attempt $attempt of $MAX_RECONNECT_ATTEMPTS")
-                onReconnecting?.invoke(attempt)
 
                 try {
-                    socket?.close()
-                    socket = null
-                    inputStream = null
-                    outputStream = null
+                    cleanupForReconnect()
 
                     socket = Socket()
                     socket?.apply {
                         tcpNoDelay = true
-                        soTimeout = 60000
+                        soTimeout = SOCKET_READ_TIMEOUT_MS
                         sendBufferSize = 524288
                         receiveBufferSize = 524288
                         keepAlive = true
                     }
-                    socket?.connect(java.net.InetSocketAddress(host, port), 10000)
+                    socket?.connect(java.net.InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
 
                     inputStream = socket?.getInputStream()
                     outputStream = socket?.getOutputStream()
 
                     Log.d(TAG, "autoReconnect: success on attempt $attempt")
                     _isReconnecting = false
+                    reconnected = true
                     startHeartBeat()
-                    onReconnected?.invoke()
-                    return@withContext Result.success(Unit)
+                    break
                 } catch (e: Exception) {
                     Log.e(TAG, "autoReconnect: attempt $attempt failed: ${e.message}")
 
                     if (attempt < MAX_RECONNECT_ATTEMPTS) {
-                        delay(RECONNECT_DELAY_MS)
+                        // 首次失败立即重试，后续递增延迟: 0, 500, 1000, 1500ms
+                        val delayMs = (attempt - 1) * 500L
+                        if (delayMs > 0) delay(delayMs)
                     }
                 }
             }
 
-            Log.d(TAG, "autoReconnect: all attempts exhausted, starting background reconnect")
-            _isReconnecting = false
-            onDisconnected?.invoke()
-            startBackgroundReconnect()
-            Result.failure(Exception("重连失败，后台继续尝试"))
+            if (reconnected) {
+                result = Result.success(Unit)
+            } else {
+                Log.d(TAG, "autoReconnect: all attempts exhausted, starting background reconnect")
+                _isReconnecting = false
+                onDisconnected?.invoke()
+                startBackgroundReconnect()
+                result = Result.failure(Exception("重连失败，后台继续尝试"))
+            }
         } finally {
             reconnectMutex.unlock()
         }
+
+        // onReconnected 在 mutex 释放后调用，避免回调异常阻塞重连
+        if (result.isSuccess) {
+            onReconnected?.invoke()
+        }
+        result
     }
 
     private fun startBackgroundReconnect() {
@@ -172,33 +185,27 @@ class TcpClient : TransferClient {
 
         Log.d(TAG, "startBackgroundReconnect: starting periodic reconnect")
         backgroundReconnectJob = coroutineScope.launch {
+            _isReconnecting = true
+            onReconnecting?.invoke(0)
             while (!isManuallyDisconnected && !isConnected) {
-                delay(BACKGROUND_RECONNECT_INTERVAL_MS)
-                if (isManuallyDisconnected || isConnected) break
-
                 Log.d(TAG, "backgroundReconnect: attempting reconnect...")
-                _isReconnecting = true
-                onReconnecting?.invoke(0)
 
                 try {
                     val host = lastHost ?: break
                     val port = lastPort ?: break
 
-                    socket?.close()
-                    socket = null
-                    inputStream = null
-                    outputStream = null
+                    cleanupForReconnect()
 
                     withContext(Dispatchers.IO) {
                         socket = Socket()
                         socket?.apply {
                             tcpNoDelay = true
-                            soTimeout = 60000
+                            soTimeout = SOCKET_READ_TIMEOUT_MS
                             sendBufferSize = 524288
                             receiveBufferSize = 524288
                             keepAlive = true
                         }
-                        socket?.connect(java.net.InetSocketAddress(host, port), 10000)
+                        socket?.connect(java.net.InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
                         inputStream = socket?.getInputStream()
                         outputStream = socket?.getOutputStream()
                     }
@@ -210,9 +217,12 @@ class TcpClient : TransferClient {
                     break
                 } catch (e: Exception) {
                     Log.e(TAG, "backgroundReconnect: failed: ${e.message}")
-                    _isReconnecting = false
                 }
+
+                // 失败后才 delay，下次再尝试
+                delay(BACKGROUND_RECONNECT_INTERVAL_MS)
             }
+            _isReconnecting = false
         }
     }
 
@@ -225,17 +235,31 @@ class TcpClient : TransferClient {
         isManuallyDisconnected = true
         stopHeartBeat()
         stopBackgroundReconnect()
-        // 取消所有协程
-        coroutineScope.cancel()
         _isReconnecting = false
-        try {
-            socket?.close()
-        } catch (e: IOException) { }
+        // 先关闭流，再关闭 socket，避免资源泄漏
+        closeResources()
+        lastHost = null
+        lastPort = null
+    }
+
+    /** 安全关闭 socket 和流资源 */
+    private fun closeResources() {
+        try { outputStream?.close() } catch (e: Exception) { }
+        try { inputStream?.close() } catch (e: Exception) { }
+        try { socket?.close() } catch (e: Exception) { }
         socket = null
         inputStream = null
         outputStream = null
-        lastHost = null
-        lastPort = null
+    }
+
+    /** 重连前清理旧资源（不清除 lastHost/lastPort） */
+    private fun cleanupForReconnect() {
+        try { outputStream?.close() } catch (e: Exception) { }
+        try { inputStream?.close() } catch (e: Exception) { }
+        try { socket?.close() } catch (e: Exception) { }
+        socket = null
+        inputStream = null
+        outputStream = null
     }
 
     private fun startHeartBeat() {
@@ -245,7 +269,8 @@ class TcpClient : TransferClient {
                 try {
                     delay(HEARTBEAT_INTERVAL_MS)
                     Log.d(TAG, "sending heartbeat...")
-                    writeRaw(byteArrayOf(0x00))
+                    // 心跳包：5字节header（命令0x00 + 长度0），符合协议格式
+                    writeRaw(byteArrayOf(0x00, 0x00, 0x00, 0x00, 0x00))
                 } catch (e: Exception) {
                     Log.e(TAG, "heartbeat error: ${e.message}")
                     if (!isManuallyDisconnected) {

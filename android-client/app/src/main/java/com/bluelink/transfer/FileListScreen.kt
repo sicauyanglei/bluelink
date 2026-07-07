@@ -289,20 +289,6 @@ fun FileListScreen(
             quickDirs = savedDirs.split(",").filter { it.isNotEmpty() }
         }
         deleteAfterInstall = prefs.getBoolean("delete_after_install", false)
-        
-        // Load downloaded files cache
-        val savedDownloadedFiles = prefs.getString("downloaded_files", "") ?: ""
-        if (savedDownloadedFiles.isNotEmpty()) {
-            val entries = savedDownloadedFiles.split(";;")
-            val map = mutableMapOf<String, String>()
-            for (entry in entries) {
-                val parts = entry.split("::")
-                if (parts.size == 2) {
-                    map[parts[0]] = parts[1]
-                }
-            }
-            downloadedFiles = map
-        }
     }
 
     // File picker for upload
@@ -1533,12 +1519,9 @@ fun FileListScreen(
                                                 prefs.edit().putBoolean("delete_after_install", true).apply()
                                             }
                                             
-                                            // Save download record (persisted)
+                                            // Save download record (in-memory only, reset on app restart)
                                             downloadedFiles = downloadedFiles + (dlKey to downloadedFileName)
-                                            val prefs2 = context.getSharedPreferences("file_transfer_prefs", android.content.Context.MODE_PRIVATE)
-                                            val downloadedFilesStr = downloadedFiles.entries.joinToString(";;") { "${it.key}::${it.value}" }
-                                            prefs2.edit().putString("downloaded_files", downloadedFilesStr).apply()
-                                            
+
                                             // Record quick directory (only if downloading a file, not resuming)
                                             if (localProgress == 0L && currentPath.isNotEmpty()) {
                                                 if (currentPath !in quickDirs) {
@@ -1583,9 +1566,6 @@ fun FileListScreen(
                                 // 清除下载记录，允许重新下载
                                 downloadProgress = downloadProgress - dlKey
                                 downloadedFiles = downloadedFiles - dlKey
-                                val prefs = context.getSharedPreferences("file_transfer_prefs", android.content.Context.MODE_PRIVATE)
-                                val downloadedFilesStr = downloadedFiles.entries.joinToString(";;") { "${it.key}::${it.value}" }
-                                prefs.edit().putString("downloaded_files", downloadedFilesStr).apply()
                                 // 触发重新下载
                                 scope.launch {
                                     downloadingFileName = file.name
@@ -1630,9 +1610,6 @@ fun FileListScreen(
                                         lastDownloadedFile = downloadedFileName
                                         statusMessage = "重新下载完成: $downloadedFileName"
                                         downloadedFiles = downloadedFiles + (dlKey to downloadedFileName)
-                                        val prefs2 = context.getSharedPreferences("file_transfer_prefs", android.content.Context.MODE_PRIVATE)
-                                        val downloadedFilesStr2 = downloadedFiles.entries.joinToString(";;") { "${it.key}::${it.value}" }
-                                        prefs2.edit().putString("downloaded_files", downloadedFilesStr2).apply()
                                     } else {
                                         val errorMsg = result.exceptionOrNull()?.message ?: ""
                                         statusMessage = "重新下载失败: $errorMsg"

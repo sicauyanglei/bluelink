@@ -32,6 +32,8 @@ public partial class MainWindow : Window
     private bool _isTcpConnected = false;
     private readonly List<object> _activeServices = new();
     private readonly object _servicesLock = new();
+    private TcpConnectedClient? _currentTcpClient;
+    private readonly object _currentTcpClientLock = new();
     private static readonly string LogFilePath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "BluLink",
@@ -536,6 +538,24 @@ public partial class MainWindow : Window
 
         System.Diagnostics.Debug.WriteLine($"[TCP] Client connected");
 
+        // 新连接到来时，关闭旧连接，避免资源占用和冲突
+        TcpConnectedClient? oldClient = null;
+        lock (_currentTcpClientLock)
+        {
+            oldClient = _currentTcpClient;
+            _currentTcpClient = client;
+        }
+        if (oldClient != null && oldClient != client)
+        {
+            try
+            {
+                System.Diagnostics.Debug.WriteLine("[TCP] Closing previous client connection");
+                dispatcher.Invoke(() => LogListBox.Items.Insert(0, $"[{DateTime.Now:HH:mm:ss}] 检测到重连，关闭旧连接..."));
+                oldClient.Close();
+            }
+            catch { }
+        }
+
         // Show notification for new connection
         dispatcher.Invoke(() => {
             _isTcpConnected = true;
@@ -580,6 +600,14 @@ public partial class MainWindow : Window
             lock (_servicesLock)
             {
                 _activeServices.Remove(service);
+            }
+            // 清理当前客户端引用（如果是当前连接）
+            lock (_currentTcpClientLock)
+            {
+                if (_currentTcpClient == client)
+                {
+                    _currentTcpClient = null;
+                }
             }
             dispatcher.Invoke(() => {
                 _isTcpConnected = false;

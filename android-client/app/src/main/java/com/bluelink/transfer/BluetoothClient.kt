@@ -6,6 +6,8 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothSocket
 import android.util.Log
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
@@ -19,11 +21,10 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
         private const val TAG = "BluetoothClient"
         private const val CONNECT_TIMEOUT_MS = 30000
         private const val READ_TIMEOUT_MS = 30000
-        private const val MAX_RECONNECT_ATTEMPTS = 3
-        private const val RECONNECT_DELAY_MS = 2000L
-        private const val HEARTBEAT_INTERVAL_MS = 30000L
-        private const val HEARTBEAT_TIMEOUT_MS = 10000L
-        private const val BACKGROUND_RECONNECT_INTERVAL_MS = 5000L
+        private const val MAX_RECONNECT_ATTEMPTS = 5
+        private const val HEARTBEAT_INTERVAL_MS = 8000L
+        private const val HEARTBEAT_TIMEOUT_MS = 8000L
+        private const val BACKGROUND_RECONNECT_INTERVAL_MS = 3000L
     }
 
     private var socket: BluetoothSocket? = null
@@ -40,11 +41,14 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
     private var heartBeatJob: kotlinx.coroutines.Job? = null
     private var backgroundReconnectJob: kotlinx.coroutines.Job? = null
     private var isManuallyDisconnected = false
+    private val reconnectMutex = Mutex()
 
     private var _isReconnecting = false
     override val isReconnecting: Boolean get() = _isReconnecting
 
-    override val isConnected: Boolean get() = socket?.isConnected == true && !_isReconnecting
+    // BluetoothSocket.isConnected 反映实际连接状态，但仍需结合 outputStream 判断
+    override val isConnected: Boolean get() =
+        socket?.isConnected == true && outputStream != null && !_isReconnecting
 
     override val hasConnectionInfo: Boolean get() = lastConnectedDevice != null
 
@@ -87,54 +91,83 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
     }
 
     override suspend fun autoReconnect(): Result<Unit> = withContext(Dispatchers.IO) {
-        val device = lastConnectedDevice
-        if (device == null) {
-            Log.d(TAG, "autoReconnect: no last connected device")
-            return@withContext Result.failure(Exception("无上次连接设备"))
+        // 防止多个autoReconnect同时运行
+        if (!reconnectMutex.tryLock()) {
+            Log.d(TAG, "autoReconnect: another reconnection in progress, skipping")
+            return@withContext Result.failure(Exception("已有重连进行中"))
         }
 
-        _isReconnecting = true
-        for (attempt in 1..MAX_RECONNECT_ATTEMPTS) {
-            Log.d(TAG, "autoReconnect: attempt $attempt of $MAX_RECONNECT_ATTEMPTS")
-            onReconnecting?.invoke(attempt)
+        val result: Result<Unit>
+        try {
+            val device = lastConnectedDevice
+            if (device == null) {
+                Log.d(TAG, "autoReconnect: no last connected device")
+                return@withContext Result.failure(Exception("无上次连接设备"))
+            }
 
-            try {
-                socket?.close()
-                socket = null
-                inputStream = null
-                outputStream = null
+            if (isManuallyDisconnected) {
+                Log.d(TAG, "autoReconnect: manually disconnected, abort")
+                return@withContext Result.failure(Exception("已手动断开"))
+            }
 
-                @Suppress("UNCHECKED_CAST")
-                val createSocket = device.javaClass.getMethod(
-                    "createRfcommSocketToServiceRecord",
-                    UUID::class.java
-                )
-                socket = createSocket.invoke(device, SERVICE_UUID) as BluetoothSocket
+            // 停止后台重连，避免冲突
+            stopBackgroundReconnect()
 
-                socket?.connect()
-                inputStream = socket?.inputStream
-                outputStream = socket?.outputStream
+            Log.d(TAG, "autoReconnect: starting")
+            _isReconnecting = true
+            onReconnecting?.invoke(1)  // 只通知一次UI
+            var reconnected = false
+            for (attempt in 1..MAX_RECONNECT_ATTEMPTS) {
+                Log.d(TAG, "autoReconnect: attempt $attempt of $MAX_RECONNECT_ATTEMPTS")
 
-                Log.d(TAG, "autoReconnect: success on attempt $attempt")
-                _isReconnecting = false
-                startHeartBeat()
-                onReconnected?.invoke()
-                return@withContext Result.success(Unit)
-            } catch (e: Exception) {
-                Log.e(TAG, "autoReconnect: attempt $attempt failed: ${e.message}")
-                toast?.invoke("重连失败 (${attempt}/$MAX_RECONNECT_ATTEMPTS)")
+                try {
+                    cleanupForReconnect()
 
-                if (attempt < MAX_RECONNECT_ATTEMPTS) {
-                    delay(RECONNECT_DELAY_MS)
+                    @Suppress("UNCHECKED_CAST")
+                    val createSocket = device.javaClass.getMethod(
+                        "createRfcommSocketToServiceRecord",
+                        UUID::class.java
+                    )
+                    socket = createSocket.invoke(device, SERVICE_UUID) as BluetoothSocket
+
+                    socket?.connect()
+                    inputStream = socket?.inputStream
+                    outputStream = socket?.outputStream
+
+                    Log.d(TAG, "autoReconnect: success on attempt $attempt")
+                    _isReconnecting = false
+                    reconnected = true
+                    startHeartBeat()
+                    break
+                } catch (e: Exception) {
+                    Log.e(TAG, "autoReconnect: attempt $attempt failed: ${e.message}")
+
+                    if (attempt < MAX_RECONNECT_ATTEMPTS) {
+                        // 首次失败立即重试，后续递增延迟: 0, 500, 1000, 1500ms
+                        val delayMs = (attempt - 1) * 500L
+                        if (delayMs > 0) delay(delayMs)
+                    }
                 }
             }
+
+            if (reconnected) {
+                result = Result.success(Unit)
+            } else {
+                Log.d(TAG, "autoReconnect: all attempts exhausted, starting background reconnect")
+                _isReconnecting = false
+                onDisconnected?.invoke()
+                startBackgroundReconnect()
+                result = Result.failure(Exception("重连失败，后台继续尝试"))
+            }
+        } finally {
+            reconnectMutex.unlock()
         }
 
-        Log.d(TAG, "autoReconnect: all attempts exhausted, starting background reconnect")
-        _isReconnecting = false
-        onDisconnected?.invoke()
-        startBackgroundReconnect()
-        Result.failure(Exception("重连失败，后台继续尝试"))
+        // onReconnected 在 mutex 释放后调用，避免回调异常阻塞重连
+        if (result.isSuccess) {
+            onReconnected?.invoke()
+        }
+        result
     }
 
     private fun startBackgroundReconnect() {
@@ -143,20 +176,14 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
 
         Log.d(TAG, "startBackgroundReconnect: starting periodic reconnect")
         backgroundReconnectJob = coroutineScope.launch {
+            _isReconnecting = true
+            onReconnecting?.invoke(0)
             while (!isManuallyDisconnected && !isConnected) {
-                delay(BACKGROUND_RECONNECT_INTERVAL_MS)
-                if (isManuallyDisconnected || isConnected) break
-
                 val device = lastConnectedDevice ?: break
                 Log.d(TAG, "backgroundReconnect: attempting reconnect...")
-                _isReconnecting = true
-                onReconnecting?.invoke(0)
 
                 try {
-                    socket?.close()
-                    socket = null
-                    inputStream = null
-                    outputStream = null
+                    cleanupForReconnect()
 
                     withContext(Dispatchers.IO) {
                         @Suppress("UNCHECKED_CAST")
@@ -177,9 +204,12 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
                     break
                 } catch (e: Exception) {
                     Log.e(TAG, "backgroundReconnect: failed: ${e.message}")
-                    _isReconnecting = false
                 }
+
+                // 失败后才 delay，下次再尝试
+                delay(BACKGROUND_RECONNECT_INTERVAL_MS)
             }
+            _isReconnecting = false
         }
     }
 
@@ -192,12 +222,15 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
         isManuallyDisconnected = true
         stopHeartBeat()
         stopBackgroundReconnect()
-        // 取消所有协程
-        coroutineScope.cancel()
         _isReconnecting = false
+        // 先关闭流，再关闭 socket，避免资源泄漏
+        try {
+            outputStream?.close()
+        } catch (e: Exception) { }
         try {
             inputStream?.close()
-            outputStream?.close()
+        } catch (e: Exception) { }
+        try {
             socket?.close()
             Log.d(TAG, "disconnected")
         } catch (e: IOException) {
@@ -209,6 +242,16 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
         lastConnectedDevice = null
     }
 
+    /** 重连前清理旧资源（不清除 lastConnectedDevice） */
+    private fun cleanupForReconnect() {
+        try { outputStream?.close() } catch (e: Exception) { }
+        try { inputStream?.close() } catch (e: Exception) { }
+        try { socket?.close() } catch (e: Exception) { }
+        socket = null
+        inputStream = null
+        outputStream = null
+    }
+
     private fun startHeartBeat() {
         stopHeartBeat()
         heartBeatJob = coroutineScope.launch {
@@ -216,7 +259,8 @@ class BluetoothClient(private val adapter: BluetoothAdapter) : TransferClient {
                 try {
                     delay(HEARTBEAT_INTERVAL_MS)
                     Log.d(TAG, "sending heartbeat...")
-                    writeRaw(byteArrayOf(0x00))
+                    // 心跳包：5字节header（命令0x00 + 长度0），符合协议格式
+                    writeRaw(byteArrayOf(0x00, 0x00, 0x00, 0x00, 0x00))
                 } catch (e: Exception) {
                     Log.e(TAG, "heartbeat error: ${e.message}")
                     if (!isManuallyDisconnected) {

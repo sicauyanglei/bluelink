@@ -17,6 +17,20 @@ public class TcpServer : IDisposable
 
     public const int DefaultPort = 9000;
 
+    // TCP KeepAlive 配置：快速检测断连
+    // 启用 keepalive，2秒后开始探测，每1秒探测一次，3次失败判定断连
+    private static readonly byte[] KeepAliveValues = BuildKeepAliveValues(true, 2000, 1000, 3);
+
+    private static byte[] BuildKeepAliveValues(bool on, uint time, uint interval, uint retryCount)
+    {
+        // WSAIoctrl SIO_KEEPALIVE_VALS 结构: on/off(4) + idle time(4) + interval(4)
+        var bytes = new byte[12];
+        BitConverter.GetBytes(on ? 1u : 0u).CopyTo(bytes, 0);
+        BitConverter.GetBytes(time).CopyTo(bytes, 4);
+        BitConverter.GetBytes(interval).CopyTo(bytes, 8);
+        return bytes;
+    }
+
     public bool IsRunning
     {
         get { lock (_lock) { return _isRunning; } }
@@ -79,6 +93,17 @@ public class TcpServer : IDisposable
             {
                 ConnectionStatusChanged?.Invoke(this, "正在等待TCP连接...");
                 var client = await _listener.AcceptTcpClientAsync(token);
+
+                // 启用 KeepAlive 以快速检测断连
+                try
+                {
+                    client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                    client.Client.IOControl(IOControlCode.KeepAliveValues, KeepAliveValues, null);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[TCP] SetKeepAlive failed: {ex.Message}");
+                }
 
                 ConnectionStatusChanged?.Invoke(this, "客户端已连接!");
                 var connectedClient = new TcpConnectedClient(client);
