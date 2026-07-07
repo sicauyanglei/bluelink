@@ -14,17 +14,38 @@
  */
 
 const { WebSocketServer, WebSocket } = require('ws');
+const http = require('http');
 
 const PORT = process.env.PORT || 9090;
 
-const wss = new WebSocketServer({ port: PORT });
+// 先创建HTTP服务器，用于健康检查
+const server = http.createServer((req, res) => {
+    if (req.url === '/' || req.url === '/health') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            status: 'ok',
+            service: 'bluelink-relay',
+            pcClients: pcClients.size,
+            androidClients: androidClients.size,
+            uptime: process.uptime()
+        }));
+    } else {
+        res.writeHead(404);
+        res.end('Not Found');
+    }
+});
+
+const wss = new WebSocketServer({ server });
 
 // 存储已注册的PC服务端连接: deviceId -> { ws, info }
 const pcClients = new Map();
 // 存储Android客户端连接: deviceId -> ws
 const androidClients = new Map();
 
-console.log(`BlueLink中继服务器启动，端口: ${PORT}`);
+server.listen(PORT, () => {
+    console.log(`BlueLink中继服务器启动，端口: ${PORT}`);
+    console.log(`健康检查: http://localhost:${PORT}/health`);
+});
 
 wss.on('connection', (ws, req) => {
     const clientIP = req.socket.remoteAddress;

@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: bluelink-relay
+    runtime: node
+    plan: free
+    region: singapore  # 新加坡节点，国内访问较快
+    branch: feature/static/version
+    rootDir: relay-server
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 20.0.0
