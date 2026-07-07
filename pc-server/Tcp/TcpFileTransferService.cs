@@ -12,14 +12,14 @@ public class TcpFileTransferService
     private readonly string _sharePath;
     private readonly string _uploadPath;
     private string _currentPath = "";  // Relative path from sharePath
-    private readonly TcpConnectedClient _client;
+    private readonly ITransferConnection _client;
     private readonly Dispatcher _dispatcher;
     private const int CHUNK_SIZE = 32768; // 32KB chunks for faster transfer
 
     public event EventHandler<string>? LogReceived;
     public event EventHandler<TransferProgress>? ProgressChanged;
 
-    public TcpFileTransferService(string sharePath, string uploadPath, TcpConnectedClient client, Dispatcher dispatcher)
+    public TcpFileTransferService(string sharePath, string uploadPath, ITransferConnection client, Dispatcher dispatcher)
     {
         _sharePath = sharePath;
         _uploadPath = uploadPath;

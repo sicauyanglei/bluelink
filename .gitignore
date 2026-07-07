@@ -10,6 +10,7 @@ out/
 *.aab
 android-client/app/build/
 android-client/.gradle/
+android-client/local.properties
 
 # Logs
 *.log

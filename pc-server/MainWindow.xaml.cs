@@ -30,6 +30,9 @@ public partial class MainWindow : Window
     private bool _isTcpRunning = false;
     private bool _isBluetoothConnected = false;
     private bool _isTcpConnected = false;
+    private RelayClient? _relayClient;
+    private bool _isRelayRunning = false;
+    private string _deviceId = "";
     private readonly List<object> _activeServices = new();
     private readonly object _servicesLock = new();
     private TcpConnectedClient? _currentTcpClient;
@@ -529,6 +532,195 @@ public partial class MainWindow : Window
         StopTcpButton.IsEnabled = false;
     }
 
+    private async void StartRelay_Click(object sender, RoutedEventArgs e)
+    {
+        var relayUrl = RelayServerTextBox.Text.Trim();
+        if (string.IsNullOrEmpty(relayUrl))
+        {
+            MessageBox.Show("请输入中继服务器地址");
+            return;
+        }
+
+        // 读取用户输入的设备名（如未输入则使用机器名）
+        var deviceName = RelayDeviceNameTextBox.Text.Trim();
+        if (string.IsNullOrEmpty(deviceName))
+        {
+            deviceName = Environment.MachineName;
+        }
+        // 规范化设备名 -> deviceId：小写字母数字+连字符
+        var baseId = System.Text.RegularExpressions.Regex.Replace(deviceName.ToLowerInvariant(), @"[^a-z0-9\-]", "-");
+        baseId = System.Text.RegularExpressions.Regex.Replace(baseId, @"\-+", "-").Trim('-');
+        if (string.IsNullOrEmpty(baseId)) baseId = "pc";
+        // 加上随机后缀避免冲突（类似花生壳的子域名占用检查）
+        _deviceId = $"{baseId}-{Random.Shared.Next(100, 999)}";
+
+        RelayDeviceNameTextBox.Text = deviceName;
+        RelayDeviceId.Text = _deviceId;
+        RelayConnectionMode.Text = "中转模式";
+
+        // 读取本地 TCP 端口
+        int tcpPort = 9000;
+        if (int.TryParse(TcpPortTextBox?.Text, out var p)) tcpPort = p;
+        RelayLocalPort.Text = tcpPort.ToString();
+
+        _relayClient = new RelayClient(relayUrl, _deviceId, deviceName, tcpPort);
+        _relayClient.StatusChanged += OnRelayStatusChanged;
+        _relayClient.ClientConnected += OnRelayClientConnected;
+        _relayClient.ClientDisconnected += OnRelayClientDisconnected;
+        _relayClient.DataReceived += OnRelayDataReceived;
+        _relayClient.PublicIPChanged += (s, ip) => Dispatcher.BeginInvoke(() =>
+        {
+            RelayPublicIP.Text = string.IsNullOrEmpty(ip) ? "-" : ip;
+        });
+
+        _isRelayRunning = true;
+        StartRelayButton.IsEnabled = false;
+        StopRelayButton.IsEnabled = true;
+        RelayDeviceNameTextBox.IsEnabled = false;
+        RelayServerTextBox.IsEnabled = false;
+
+        AddLog($"启动互联网穿透，服务器: {relayUrl}, 设备ID: {_deviceId}");
+
+        // 确保 TCP 服务已启动（中继模式下数据通过 WebSocket 传入，但用 TcpFileTransferService 处理）
+        if (!_isTcpRunning)
+        {
+            StartTcp_Click(sender, e);
+        }
+
+        await Task.Run(() => _relayClient.StartAsync());
+    }
+
+    private void StopRelay_Click(object sender, RoutedEventArgs e)
+    {
+        _relayClient?.Stop();
+        _relayClient = null;
+        _isRelayRunning = false;
+        RelayStatus.Text = "已停止";
+        RelayStatusIndicator.Fill = (System.Windows.Media.Brush)FindResource("TextMutedBrush");
+        RelayDeviceId.Text = "-";
+        RelayPublicIP.Text = "-";
+        RelayConnectionMode.Text = "-";
+        StartRelayButton.IsEnabled = true;
+        StopRelayButton.IsEnabled = false;
+        RelayDeviceNameTextBox.IsEnabled = true;
+        RelayServerTextBox.IsEnabled = true;
+        AddLog("互联网穿透已停止");
+    }
+
+    private void OnRelayStatusChanged(object? sender, string status)
+    {
+        Dispatcher.BeginInvoke(() =>
+        {
+            RelayStatus.Text = status;
+            RelayStatusIndicator.Fill = _relayClient?.IsConnected == true
+                ? (System.Windows.Media.Brush)FindResource("SuccessBrush")
+                : (System.Windows.Media.Brush)FindResource("TextMutedBrush");
+            AddLog($"[穿透] {status}");
+        });
+    }
+
+    private void OnRelayClientConnected(object? sender, EventArgs e)
+    {
+        Dispatcher.BeginInvoke(() =>
+        {
+            RelayStatusIndicator.Fill = (System.Windows.Media.Brush)FindResource("SuccessBrush");
+            AddLog("[穿透] Android客户端已连接");
+        });
+
+        // 启动 TcpFileTransferService 通过 Relay 适配器处理数据
+        _ = Task.Run(async () => await HandleRelayClientAsync());
+    }
+
+    private void OnRelayClientDisconnected(object? sender, EventArgs e)
+    {
+        Dispatcher.BeginInvoke(() =>
+        {
+            AddLog("[穿透] Android客户端已断开");
+        });
+        // 适配器将在通道关闭时自动结束 HandleClientAsync 循环
+    }
+
+    private async void OnRelayDataReceived(object? sender, byte[] data)
+    {
+        // 数据由 RelayTransferAdapter 通过 DataReceived 事件直接处理
+        // 这里仅做日志记录（少量日志以避免干扰）
+        System.Diagnostics.Debug.WriteLine($"[穿透] 收到数据: {data.Length} bytes");
+    }
+
+    private async Task HandleRelayClientAsync()
+    {
+        var dispatcher = Dispatcher;
+        if (dispatcher == null || _relayClient == null) return;
+
+        // 捕获共享路径和上传路径
+        string sharePath = string.Empty;
+        string uploadPath = string.Empty;
+        dispatcher.Invoke(() =>
+        {
+            sharePath = SharePathTextBox.Text;
+            uploadPath = UploadPathTextBox.Text;
+        });
+
+        RelayTransferAdapter? adapter = null;
+        TcpFileTransferService? service = null;
+
+        try
+        {
+            adapter = new RelayTransferAdapter(_relayClient, "Relay Client");
+            service = new TcpFileTransferService(sharePath, uploadPath, adapter, dispatcher);
+            service.LogReceived += Service_LogReceived;
+            lock (_servicesLock)
+            {
+                _activeServices.Add(service);
+            }
+
+            dispatcher.Invoke(() =>
+            {
+                _isTcpConnected = true;
+                ShowNotification("远程已连接", "Android客户端通过中继服务器连接");
+                UpdateTrayIcon();
+                TcpConnectedDeviceName.Text = "已连接: 远程客户端";
+                TcpConnectedDeviceName.Visibility = Visibility.Visible;
+                AddLog("[穿透] 开始处理远程客户端数据...");
+            });
+
+            await service.HandleClientAsync();
+
+            dispatcher.Invoke(() => AddLog("[穿透] 远程客户端处理结束"));
+        }
+        catch (Exception ex)
+        {
+            dispatcher.Invoke(() => AddLog($"[穿透] 处理远程客户端错误: {ex.Message}"));
+        }
+        finally
+        {
+            try { adapter?.Close(); } catch { }
+            if (service != null)
+            {
+                lock (_servicesLock)
+                {
+                    _activeServices.Remove(service);
+                }
+            }
+            dispatcher.Invoke(() =>
+            {
+                _isTcpConnected = false;
+                UpdateTrayIcon();
+                TcpConnectedDeviceName.Visibility = Visibility.Collapsed;
+                AddLog("[穿透] 远程客户端已断开");
+            });
+        }
+    }
+
+    private void CopyDeviceId_Click(object sender, RoutedEventArgs e)
+    {
+        if (!string.IsNullOrEmpty(_deviceId))
+        {
+            Clipboard.SetText(_deviceId);
+            MessageBox.Show("设备ID已复制到剪贴板", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+    }
+
     private async void OnTcpClientConnected(object? sender, TcpClientConnectionEventArgs e)
     {
         var client = e.Client;
@@ -624,6 +816,13 @@ public partial class MainWindow : Window
         Dispatcher?.Invoke(() => {
             LogListBox.Items.Insert(0, $"[{DateTime.Now:HH:mm:ss}] {log}");
             RefreshFileList();
+        });
+    }
+
+    private void AddLog(string msg)
+    {
+        Dispatcher?.Invoke(() => {
+            LogListBox.Items.Insert(0, $"[{DateTime.Now:HH:mm:ss}] {msg}");
         });
     }
 

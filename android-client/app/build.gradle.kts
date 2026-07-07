@@ -61,4 +61,5 @@ dependencies {
     implementation("androidx.compose.ui:ui:1.5.4")
     implementation("androidx.compose.material3:material3:1.2.0")
     implementation("androidx.compose.material:material-icons-extended:1.5.4")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }

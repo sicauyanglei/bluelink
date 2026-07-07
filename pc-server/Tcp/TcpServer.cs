@@ -136,7 +136,19 @@ public class TcpClientConnectionEventArgs : EventArgs
     public TcpClientConnectionEventArgs(TcpConnectedClient client) => Client = client;
 }
 
-public class TcpConnectedClient
+/// <summary>
+/// 抽象连接接口 - TcpConnectedClient 和 RelayTransferAdapter 均实现此接口
+/// </summary>
+public interface ITransferConnection
+{
+    string DeviceName { get; }
+    string DeviceAddress { get; }
+    Task<int> ReadAsync(byte[] buffer, int offset, int count);
+    Task WriteAsync(byte[] buffer, int offset, int count);
+    void Close();
+}
+
+public class TcpConnectedClient : ITransferConnection
 {
     private readonly TcpClient _client;
 

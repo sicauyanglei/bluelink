@@ -8,6 +8,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cast
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Error
@@ -42,10 +43,10 @@ import kotlinx.coroutines.withContext
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ConnectScreen(
-    onConnected: (TcpClient, FileTransferService) -> Unit,
+    onConnected: (TransferClient, FileTransferService) -> Unit,
     onDisconnect: (() -> Unit)? = null,
     onReconnecting: () -> Unit = {},
-    onReconnected: (TcpClient, FileTransferService) -> Unit = { _, _ -> },
+    onReconnected: (TransferClient, FileTransferService) -> Unit = { _, _ -> },
     isConnected: Boolean = false,
     tabVisible: Boolean = false,
     visible: Boolean = true,
@@ -71,8 +72,16 @@ fun ConnectScreen(
     var hotspotIP by remember { mutableStateOf<String?>(null) }
     var gatewayIP by remember { mutableStateOf<String?>(null) }
 
+    // 互联网穿透相关状态
+    var relayServerUrl by remember { mutableStateOf("ws://your-server.com:9090") }
+    var relayDeviceId by remember { mutableStateOf("") }
+    var isRelayConnecting by remember { mutableStateOf(false) }
+    var relayConnectionMode by remember { mutableStateOf("") }  // "P2P直连" / "中转"
+
     // Current TCP client for reconnection support
     var currentTcpClient by remember { mutableStateOf<TcpClient?>(null) }
+    // Current Relay client for reconnection support
+    var currentRelayClient by remember { mutableStateOf<WebSocketRelayClient?>(null) }
 
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -153,7 +162,7 @@ fun ConnectScreen(
                         gatewayIP = HotspotDevices.getGatewayIP()
                         status = "检测到网络变化，重新扫描..."
                         // 如果连接断开，触发重新扫描
-                        if (currentTcpClient?.isConnected == false) {
+                        if (currentTcpClient?.isConnected == false && currentRelayClient?.isConnected != true) {
                             onDisconnect?.invoke()
                         }
                     }
@@ -190,16 +199,62 @@ fun ConnectScreen(
         }
     }
 
+    // Set up Relay client reconnection callbacks
+    DisposableEffect(currentRelayClient) {
+        currentRelayClient?.onReconnecting = { attempt ->
+            reconnectAttempt = attempt
+            isReconnecting = true
+            status = if (attempt == 0) "后台重连中..." else "正在重连... ($attempt/3)"
+            onReconnecting()
+        }
+        currentRelayClient?.onReconnected = {
+            isReconnecting = false
+            status = "重连成功"
+            currentRelayClient?.let { relayClient ->
+                val transferService = FileTransferService(relayClient)
+                onReconnected(relayClient, transferService)
+            }
+        }
+        currentRelayClient?.onDisconnected = {
+            isReconnecting = true
+            status = "连接断开，后台重连中..."
+            onReconnecting()
+        }
+        currentRelayClient?.onPaired = {
+            isReconnecting = false
+            status = if (relayConnectionMode.isNotEmpty()) "连接成功（$relayConnectionMode）" else "连接成功！"
+            currentRelayClient?.let { relayClient ->
+                val transferService = FileTransferService(relayClient)
+                onReconnected(relayClient, transferService)
+            }
+        }
+        currentRelayClient?.onConnectionModeChanged = { mode ->
+            relayConnectionMode = mode
+            if (currentRelayClient?.isConnected == true) {
+                status = "已连接（$mode）"
+            } else {
+                status = "连接中（$mode）"
+            }
+        }
+        onDispose {
+            currentRelayClient?.onReconnecting = null
+            currentRelayClient?.onReconnected = null
+            currentRelayClient?.onDisconnected = null
+            currentRelayClient?.onPaired = null
+            currentRelayClient?.onConnectionModeChanged = null
+        }
+    }
+
     // 检查连接状态当App恢复时
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 // 已在重连中则跳过，避免重复触发
-                if (currentTcpClient?.isReconnecting == true) {
+                if (currentTcpClient?.isReconnecting == true || currentRelayClient?.isReconnecting == true) {
                     return@LifecycleEventObserver
                 }
-                // 异步检测连接状态，避免阻塞主线程
+                // 异步检测TCP连接状态
                 scope.launch {
                     val actualConnected = withContext(Dispatchers.IO) {
                         currentTcpClient?.checkConnection() == true
@@ -212,6 +267,20 @@ fun ConnectScreen(
                         // 触发自动重连（仅在此处触发，避免重复）
                         if (currentTcpClient?.hasConnectionInfo == true) {
                             currentTcpClient?.autoReconnect()
+                        }
+                    }
+                }
+                // 异步检测Relay连接状态
+                scope.launch {
+                    val relayConnected = withContext(Dispatchers.IO) {
+                        currentRelayClient?.checkConnection() == true
+                    }
+                    android.util.Log.d("ConnectScreen", ">>> ON_RESUME: currentRelayClient=${currentRelayClient}, checkConnection=$relayConnected")
+                    if (currentRelayClient != null && !relayConnected && currentRelayClient?.isReconnecting != true) {
+                        android.util.Log.d("ConnectScreen", ">>> 检测到Relay连接已断开，触发重连")
+                        onReconnecting()
+                        if (currentRelayClient?.hasConnectionInfo == true) {
+                            currentRelayClient?.autoReconnect()
                         }
                     }
                 }
@@ -510,6 +579,7 @@ fun ConnectScreen(
                     OutlinedButton(
                         onClick = {
                             currentTcpClient?.disconnect()
+                            currentRelayClient?.disconnect()
                             onDisconnect?.invoke()
                             status = "已断开连接"
                         },
@@ -627,6 +697,148 @@ fun ConnectScreen(
                 }
             }
             Spacer(modifier = Modifier.height(16.dp))
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Internet Relay Section
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.3f)
+            ),
+            shape = RoundedCornerShape(12.dp),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.2f)),
+            elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp)
+            ) {
+                Text(
+                    text = "互联网穿透（远程连接）",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.tertiary
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Text(
+                    text = "在PC服务端启动穿透后，输入设备ID进行远程连接",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // Relay Server URL Input
+                OutlinedTextField(
+                    value = relayServerUrl,
+                    onValueChange = { relayServerUrl = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isRelayConnecting && !isConnected,
+                    label = { Text("中继服务器地址") },
+                    placeholder = { Text("ws://your-server.com:9090") },
+                    leadingIcon = {
+                        Icon(Icons.Default.SettingsEthernet, contentDescription = null, modifier = Modifier.size(20.dp))
+                    },
+                    singleLine = true,
+                    shape = RoundedCornerShape(10.dp)
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                // Device ID Input
+                OutlinedTextField(
+                    value = relayDeviceId,
+                    onValueChange = { relayDeviceId = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isRelayConnecting && !isConnected,
+                    label = { Text("PC设备ID") },
+                    placeholder = { Text("输入PC端显示的设备ID") },
+                    leadingIcon = {
+                        Icon(Icons.Default.Computer, contentDescription = null, modifier = Modifier.size(20.dp))
+                    },
+                    singleLine = true,
+                    shape = RoundedCornerShape(10.dp)
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // Relay Connect Button
+                Button(
+                    onClick = {
+                        if (relayServerUrl.isBlank() || relayDeviceId.isBlank()) {
+                            status = "请输入中继服务器地址和设备ID"
+                            return@Button
+                        }
+                        isRelayConnecting = true
+                        status = "正在连接中继服务器..."
+                        scope.launch {
+                            val relayClient = WebSocketRelayClient()
+                            val result = relayClient.connect(relayServerUrl, relayDeviceId)
+                            if (result.isSuccess) {
+                                // 保存引用以便后续重连回调使用
+                                currentRelayClient = relayClient
+                                status = "等待配对..."
+                                isRelayConnecting = false
+                                // onPaired 由 DisposableEffect 统一设置
+                            } else {
+                                val error = result.exceptionOrNull()?.message ?: "未知错误"
+                                status = "连接失败: $error"
+                                errorMessage = error
+                                showErrorDialog = true
+                                isRelayConnecting = false
+                            }
+                        }
+                    },
+                    enabled = !isRelayConnecting && relayServerUrl.isNotBlank() && relayDeviceId.isNotBlank() && !isConnected,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp),
+                    shape = RoundedCornerShape(10.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.tertiary
+                    )
+                ) {
+                    if (isRelayConnecting) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            color = MaterialTheme.colorScheme.onTertiary,
+                            strokeWidth = 2.dp
+                        )
+                    } else {
+                        Icon(Icons.Default.Cloud, contentDescription = null, modifier = Modifier.size(18.dp))
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(if (isRelayConnecting) "连接中..." else "远程连接", style = MaterialTheme.typography.titleSmall)
+                }
+
+                // 显示当前连接方式（P2P直连 / 中转）
+                if (relayConnectionMode.isNotEmpty() && currentRelayClient?.isConnected == true) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = if (relayConnectionMode == "P2P直连") Icons.Default.CheckCircle else Icons.Default.Cloud,
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp),
+                            tint = if (relayConnectionMode == "P2P直连") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.tertiary
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "连接方式：$relayConnectionMode",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (relayConnectionMode == "P2P直连") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.tertiary
+                        )
+                    }
+                }
+            }
         }
     }
     }

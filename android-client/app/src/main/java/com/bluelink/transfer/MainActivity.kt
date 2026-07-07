@@ -39,6 +39,7 @@ class MainActivity : ComponentActivity() {
 
     private var _bluetoothClient by mutableStateOf<BluetoothClient?>(null)
     private var _tcpClient by mutableStateOf<TcpClient?>(null)
+    private var _relayClient by mutableStateOf<WebSocketRelayClient?>(null)
     private var _transferService by mutableStateOf<FileTransferService?>(null)
     private var _refreshTrigger by mutableIntStateOf(0)
     private var _pathChangedTrigger by mutableIntStateOf(0)
@@ -51,6 +52,7 @@ class MainActivity : ComponentActivity() {
     private var _resumeCount by mutableIntStateOf(0)
     val bluetoothClient get() = _bluetoothClient
     val tcpClient get() = _tcpClient
+    val relayClient get() = _relayClient
     val transferService get() = _transferService
     val refreshTrigger get() = _refreshTrigger
     val pathChangedTrigger get() = _pathChangedTrigger
@@ -363,6 +365,7 @@ class MainActivity : ComponentActivity() {
                         bluetoothAdapter = bluetoothAdapter,
                         bluetoothClient = bluetoothClient,
                         tcpClient = tcpClient,
+                        relayClient = relayClient,
                         transferService = transferService,
                         pathChangedTrigger = _pathChangedTrigger,
                         resumeCount = _resumeCount,
@@ -387,8 +390,21 @@ class MainActivity : ComponentActivity() {
                             addDebugLog("蓝牙连接成功")
                         },
                         onTcpConnected = { client, service ->
-                            _tcpClient = client
+                            // 清除之前的连接
                             _bluetoothClient = null
+                            // 根据实际类型存储，先清掉另一种
+                            when (client) {
+                                is TcpClient -> {
+                                    _relayClient?.disconnect()
+                                    _relayClient = null
+                                    _tcpClient = client
+                                }
+                                is WebSocketRelayClient -> {
+                                    _tcpClient?.disconnect()
+                                    _tcpClient = null
+                                    _relayClient = client
+                                }
+                            }
                             _transferService = service
                             _connectionStateVersion++
                             service.onPathChanged = {
@@ -401,8 +417,10 @@ class MainActivity : ComponentActivity() {
                         onDisconnect = {
                             bluetoothClient?.disconnect()
                             tcpClient?.disconnect()
+                            relayClient?.disconnect()
                             _bluetoothClient = null
                             _tcpClient = null
+                            _relayClient = null
                             _transferService = null
                             _connectionStateVersion++
                             clearConnectionInfo()
@@ -417,10 +435,18 @@ class MainActivity : ComponentActivity() {
                             if (client is TcpClient) {
                                 _tcpClient = client
                                 _bluetoothClient = null
+                                _relayClient = null
+                                saveConnectionInfo("tcp", _tcpHost, _tcpPort)
+                            } else if (client is WebSocketRelayClient) {
+                                _relayClient = client
+                                _bluetoothClient = null
+                                _tcpClient = null
+                                // 保存relay连接信息，类型也用tcp以便tryAutoReconnect处理（暂不实现relay自动重连）
                                 saveConnectionInfo("tcp", _tcpHost, _tcpPort)
                             } else if (client is BluetoothClient) {
                                 _bluetoothClient = client
                                 _tcpClient = null
+                                _relayClient = null
                                 val device = client.lastConnectedDevice
                                 saveConnectionInfo("bluetooth", "", "9000",
                                     btDeviceAddr = device?.address,
@@ -479,6 +505,7 @@ fun MainScreen(
     bluetoothAdapter: BluetoothAdapter?,
     bluetoothClient: BluetoothClient?,
     tcpClient: TcpClient?,
+    relayClient: WebSocketRelayClient? = null,
     transferService: FileTransferService?,
     pathChangedTrigger: Int = 0,
     resumeCount: Int = 0,
@@ -488,7 +515,7 @@ fun MainScreen(
     debugLogs: List<String> = emptyList(),
     showDebugLog: Boolean = false,
     onBluetoothConnected: (BluetoothClient, FileTransferService) -> Unit,
-    onTcpConnected: (TcpClient, FileTransferService) -> Unit,
+    onTcpConnected: (TransferClient, FileTransferService) -> Unit,
     onDisconnect: () -> Unit,
     onReconnecting: () -> Unit = {},
     onReconnected: (TransferClient, FileTransferService) -> Unit = { _, _ -> },
@@ -512,10 +539,12 @@ fun MainScreen(
         mutableStateOf(bluetoothClient?.isConnected == true)
     }
     val actualTcpConnected by remember(connectionStateVersion) {
-        mutableStateOf(tcpClient?.isConnected == true)
+        mutableStateOf(tcpClient?.isConnected == true || relayClient?.isConnected == true)
     }
-    val isClientReconnecting = bluetoothClient?.isReconnecting == true || tcpClient?.isReconnecting == true
-    val hasClient = bluetoothClient != null || tcpClient != null
+    val isClientReconnecting = bluetoothClient?.isReconnecting == true
+        || tcpClient?.isReconnecting == true
+        || relayClient?.isReconnecting == true
+    val hasClient = bluetoothClient != null || tcpClient != null || relayClient != null
     val isConnected = actualBluetoothConnected || actualTcpConnected
 
     // Auto-switch to file tab when connection established
@@ -528,15 +557,17 @@ fun MainScreen(
     val connectionStatus = when {
         isClientReconnecting -> "正在重连..."
         actualBluetoothConnected -> "蓝牙已连接"
-        actualTcpConnected -> "TCP已连接"
+        actualTcpConnected -> if (relayClient?.isConnected == true) "远程已连接" else "TCP已连接"
         hasClient -> "连接断开，重连中..."
         else -> "未连接"
     }
 
     val connectionType: String? = when {
         actualBluetoothConnected -> "蓝牙"
-        actualTcpConnected -> "TCP"
+        relayClient?.isConnected == true -> "远程"
+        tcpClient?.isConnected == true -> "TCP"
         bluetoothClient != null -> "蓝牙"
+        relayClient != null -> "远程"
         tcpClient != null -> "TCP"
         else -> null
     }
@@ -674,7 +705,7 @@ fun MainScreen(
                 selected = selectedTab == 1,
                 onClick = { selectedTab = 1 },
                 text = { Text("TCP") },
-                enabled = !isConnected || tcpClient?.isConnected == true
+                enabled = !isConnected || tcpClient?.isConnected == true || relayClient?.isConnected == true
             )
             Tab(
                 selected = selectedTab == 2,
@@ -738,7 +769,7 @@ fun MainScreen(
                     onReconnected(client, service)
                     selectedTab = 2
                 },
-                isConnected = tcpClient?.isConnected == true,
+                isConnected = tcpClient?.isConnected == true || relayClient?.isConnected == true,
                 tabVisible = selectedTab == 1,
                 visible = selectedTab == 1,
                 savedHost = tcpHost,
@@ -759,7 +790,7 @@ fun MainScreen(
                     )
             ) {
                 if (isConnected && transferService != null) {
-                    val client = tcpClient ?: bluetoothClient
+                    val client = tcpClient ?: relayClient ?: bluetoothClient
                     if (client != null) {
                         FileListScreen(
                             client = client,

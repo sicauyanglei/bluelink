@@ -1,0 +1,12 @@
+{
+  "name": "bluelink-relay-server",
+  "version": "1.0.0",
+  "description": "BlueLink WebSocket中继服务器，用于内网穿透",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}

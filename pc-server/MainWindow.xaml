@@ -15,6 +15,7 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
@@ -231,8 +232,134 @@
             </Grid>
         </GroupBox>
 
+        <!-- Internet Relay Section -->
+        <GroupBox Grid.Row="3" Header="互联网穿透 (远程连接)">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <!-- Control Row -->
+                <Grid Grid.Row="0" Margin="0,0,0,12">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+
+                    <Button x:Name="StartRelayButton"
+                            Grid.Column="0"
+                            Content="启动穿透"
+                            Style="{StaticResource ModernButtonStyle}"
+                            Width="100" Height="36"
+                            Click="StartRelay_Click"/>
+                    <Button x:Name="StopRelayButton"
+                            Grid.Column="1"
+                            Content="停止穿透"
+                            Style="{StaticResource SecondaryButtonStyle}"
+                            Width="100" Height="36"
+                            Margin="10,0,0,0"
+                            IsEnabled="False"
+                            Click="StopRelay_Click"/>
+
+                    <StackPanel Grid.Column="2" Orientation="Horizontal" Margin="20,0,0,0" VerticalAlignment="Center">
+                        <TextBlock Text="设备名: "
+                                   Foreground="{StaticResource TextSecondaryBrush}"
+                                   VerticalAlignment="Center"/>
+                        <TextBox x:Name="RelayDeviceNameTextBox"
+                                 Width="140" Height="36"
+                                 VerticalContentAlignment="Center"
+                                 FontSize="13"
+                                 Padding="12,8"
+                                 ToolTip="自定义设备名（字母数字和连字符）"/>
+                    </StackPanel>
+
+                    <StackPanel Grid.Column="3" Orientation="Horizontal" Margin="20,0,0,0" VerticalAlignment="Center">
+                        <TextBlock Text="服务器: "
+                                   Foreground="{StaticResource TextSecondaryBrush}"
+                                   VerticalAlignment="Center"/>
+                        <TextBox x:Name="RelayServerTextBox"
+                                 Width="300" Height="36"
+                                 Text="ws://your-server.com:9090"
+                                 VerticalContentAlignment="Center"
+                                 FontSize="13"
+                                 Padding="12,8"/>
+                    </StackPanel>
+                </Grid>
+
+                <!-- Status Row -->
+                <Border Grid.Row="1"
+                        Background="{StaticResource SurfaceVariantBrush}"
+                        CornerRadius="6"
+                        Padding="12,8">
+                    <StackPanel>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="状态: "
+                                       Foreground="{StaticResource TextSecondaryBrush}"
+                                       VerticalAlignment="Center"
+                                       Margin="0,0,8,0"/>
+                            <Ellipse x:Name="RelayStatusIndicator"
+                                     Width="10" Height="10"
+                                     Fill="{StaticResource TextMutedBrush}"
+                                     Margin="0,0,8,0"/>
+                            <TextBlock x:Name="RelayStatus"
+                                       Foreground="{StaticResource AccentCyanBrush}"
+                                       FontWeight="Medium"
+                                       VerticalAlignment="Center"/>
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                            <TextBlock Text="设备ID: "
+                                       Foreground="{StaticResource TextSecondaryBrush}"
+                                       VerticalAlignment="Center"/>
+                            <TextBlock x:Name="RelayDeviceId"
+                                       Foreground="{StaticResource PrimaryBrush}"
+                                       FontWeight="SemiBold"
+                                       FontFamily="Consolas"
+                                       VerticalAlignment="Center"/>
+                            <Button Content="复制"
+                                    Margin="10,0,0,0" Padding="8,2" FontSize="11"
+                                    Click="CopyDeviceId_Click"/>
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                            <TextBlock Text="公网IP: "
+                                       Foreground="{StaticResource TextSecondaryBrush}"
+                                       VerticalAlignment="Center"/>
+                            <TextBlock x:Name="RelayPublicIP"
+                                       Text="-"
+                                       Foreground="{StaticResource PrimaryBrush}"
+                                       FontWeight="SemiBold"
+                                       FontFamily="Consolas"
+                                       VerticalAlignment="Center"/>
+                            <TextBlock Text="    本地端口: "
+                                       Foreground="{StaticResource TextSecondaryBrush}"
+                                       VerticalAlignment="Center"
+                                       Margin="16,0,0,0"/>
+                            <TextBlock x:Name="RelayLocalPort"
+                                       Text="9000"
+                                       Foreground="{StaticResource PrimaryBrush}"
+                                       FontWeight="SemiBold"
+                                       FontFamily="Consolas"
+                                       VerticalAlignment="Center"/>
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                            <TextBlock Text="连接方式: "
+                                       Foreground="{StaticResource TextSecondaryBrush}"
+                                       VerticalAlignment="Center"/>
+                            <TextBlock x:Name="RelayConnectionMode"
+                                       Text="-"
+                                       Foreground="{StaticResource AccentCyanBrush}"
+                                       FontWeight="Medium"
+                                       VerticalAlignment="Center"/>
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+            </Grid>
+        </GroupBox>
+
         <!-- Shared Directory Section -->
-        <GroupBox Grid.Row="3" Header="共享目录">
+        <GroupBox Grid.Row="4" Header="共享目录">
             <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
@@ -309,7 +436,7 @@
         </GroupBox>
 
         <!-- Transfer Log Section -->
-        <GroupBox Grid.Row="4" Height="100">
+        <GroupBox Grid.Row="5" Height="100">
             <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
